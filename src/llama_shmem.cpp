@@ -668,7 +668,8 @@ static uint32_t propose_neural_draft(
     llama_batch step_batch = llama_batch_init(MAX_B_VERIFY, 0, 1);
     auto push_leaf = [&](uint32_t u, int32_t parent_seq) {
         int32_t kv_pos = (int32_t)draft_kv_len + (pkt->pos[u] - (int32_t)kv_commit_idx) - 1;
-        llama_memory_seq_cp(mem, parent_seq, (llama_seq_id)u, 0, (llama_pos)kv_pos);
+        llama_memory_seq_cp(mem, parent_seq, (llama_seq_id)u, -1, -1);
+        llama_memory_seq_rm(mem, (llama_seq_id)u, (llama_pos)kv_pos, -1);
         int32_t idx = step_batch.n_tokens++;
         step_batch.token[idx]     = pkt->draft_ids[u];
         step_batch.pos[idx]       = (llama_pos)kv_pos;
