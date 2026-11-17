@@ -539,6 +539,51 @@ static int32_t sample_from_logits(
     return out_top_s[0].token_id;
 }
 
+// Helper: Sample up to 2 distinct child branches (top-1 and top-2) from draft logits
+static void sample_branch_children(
+    const float * logits,
+    uint32_t n_vocab,
+    float temperature,
+    float min_p,
+    splitmix64_t & rng,
+    sparse_prob_t out_top_s[TOP_S_SUPPORT],
+    uint8_t & out_len,
+    int32_t & tok1, float & q1,
+    int32_t & tok2, float & q2
+) {
+    if (temperature <= 0.0f) {
+        int32_t best1 = 0, best2 = 1;
+        if (logits[best2] > logits[best1]) std::swap(best1, best2);
+        for (uint32_t v = 2; v < n_vocab; ++v) {
+            if (logits[v] > logits[best1]) {
+                best2 = best1;
+                best1 = (int32_t)v;
+            } else if (logits[v] > logits[best2]) {
+                best2 = (int32_t)v;
+            }
+        }
+        out_len = 2;
+        out_top_s[0] = { best1, 1.0f };
+        out_top_s[1] = { best2, 0.0f };
+        tok1 = best1; q1 = 1.0f;
+        tok2 = best2; q2 = 1.0f;
+        return;
+    }
+
+    tok1 = sample_from_logits(logits, n_vocab, temperature, min_p, rng, out_top_s, out_len);
+    q1 = 1.0f;
+    for (uint8_t i = 0; i < out_len; ++i) {
+        if (out_top_s[i].token_id == tok1) {
+            q1 = out_top_s[i].prob;
+            break;
+        }
+    }
+
+    // Select a distinct second branch from the remaining support (or fallback argmax)
+    tok2 = (out_top_s[0].token_id != tok1) ? out_top_s[0].token_id : ((out_len > 1) ? out_top_s[1].token_id : (tok1 ^ 1));
+    q2   = (out_top_s[0].token_id != tok1) ? out_top_s[0].prob     : ((out_len > 1) ? out_top_s[1].prob     : 1e-4f);
+}
+
 static uint32_t propose_neural_draft(
     struct llama_context * draft_ctx,
     const std::vector<int32_t> & history,
@@ -561,9 +606,16 @@ static uint32_t propose_neural_draft(
         return 1;
     }
 
+    const uint32_t max_nodes = (uint32_t)(1 + k_draft);
     llama_memory_t mem = llama_get_memory(draft_ctx);
+
+    // Clear auxiliary branch sequences 1..MAX_B_VERIFY-1 and trim seq 0 to verified prefix
+    for (int s = 1; s < MAX_B_VERIFY; ++s) {
+        llama_memory_seq_rm(mem, s, -1, -1);
+    }
     llama_memory_seq_rm(mem, 0, (llama_pos)draft_kv_len, -1);
 
+    // Sync any newly accepted tokens from history (including root_token at history.back()) into seq 0
     uint32_t target_len = (uint32_t)history.size();
     if (target_len > draft_kv_len) {
         uint32_t n_new = target_len - draft_kv_len;
@@ -581,43 +633,115 @@ static uint32_t propose_neural_draft(
         draft_kv_len = target_len;
     }
 
-    llama_batch step_batch = llama_batch_init(1, 0, 1);
     uint32_t n_nodes = 1;
-
-    for (int k = 0; k < k_draft; ++k) {
-        const float * d_logits = llama_get_logits_ith(draft_ctx, -1);
-        sparse_prob_t q_sup[TOP_S_SUPPORT];
-        uint8_t q_len = 0;
-        int32_t next_draft_tok = sample_from_logits(d_logits, n_vocab, temperature, min_p, rng, q_sup, q_len);
-
-        float chosen_q = 1.0f;
-        for (uint8_t i = 0; i < q_len; ++i) {
-            if (q_sup[i].token_id == next_draft_tok) {
-                chosen_q = q_sup[i].prob;
-                break;
-            }
-        }
-
+    auto add_node = [&](int8_t p, int32_t tok, float q_val, const sparse_prob_t * q_sup, uint8_t q_len) -> uint32_t {
         uint32_t u = n_nodes++;
         uint32_t d_idx = u - 1;
-        int8_t p = (int8_t)(u - 1);
-
-        pkt->draft_ids[u]         = next_draft_tok;
+        pkt->draft_ids[u]         = tok;
         pkt->parent_idx[u]        = p;
-        pkt->pos[u]               = (int32_t)(kv_commit_idx + u);
+        pkt->pos[u]               = pkt->pos[p] + 1;
         pkt->parent_mask[u]       = (uint16_t)(pkt->parent_mask[p] | (1U << u));
         pkt->q_support_len[d_idx] = q_len;
-        pkt->q_sampled[d_idx]     = chosen_q;
+        pkt->q_sampled[d_idx]     = q_val;
         memcpy(pkt->q_sparse[d_idx], q_sup, q_len * sizeof(sparse_prob_t));
+        return u;
+    };
 
-        if (k + 1 < k_draft) {
-            step_batch.n_tokens     = 1;
-            step_batch.token[0]     = next_draft_tok;
-            step_batch.pos[0]       = (llama_pos)(draft_kv_len + k);
-            step_batch.n_seq_id[0]  = 1;
-            step_batch.seq_id[0][0] = 0;
-            step_batch.logits[0]    = 1;
-            llama_decode(draft_ctx, step_batch);
+    // Depth 1: Sample top-1 (and top-2 if k_draft >= 2) from Root (node 0)
+    const float * root_logits = llama_get_logits_ith(draft_ctx, -1);
+    sparse_prob_t q_sup0[TOP_S_SUPPORT];
+    uint8_t q_len0 = 0;
+    int32_t t1 = 0, t2 = 0;
+    float q1 = 1.0f, q2 = 1.0f;
+    sample_branch_children(root_logits, n_vocab, temperature, min_p, rng, q_sup0, q_len0, t1, q1, t2, q2);
+
+    uint32_t n_d1_a = add_node(0, t1, q1, q_sup0, q_len0);
+    int32_t  n_d1_b = -1;
+    if (n_nodes < max_nodes && k_draft >= 2) {
+        n_d1_b = (int32_t)add_node(0, t2, q2, q_sup0, q_len0);
+    }
+
+    if (n_nodes >= max_nodes) {
+        return n_nodes;
+    }
+
+    // Batched decode of Depth 1 leaves using sequence branching (seq_id = node_u)
+    llama_batch step_batch = llama_batch_init(MAX_B_VERIFY, 0, 1);
+    auto push_leaf = [&](uint32_t u, int32_t parent_seq) {
+        int32_t kv_pos = (int32_t)draft_kv_len + (pkt->pos[u] - (int32_t)kv_commit_idx) - 1;
+        llama_memory_seq_cp(mem, parent_seq, (llama_seq_id)u, 0, (llama_pos)kv_pos);
+        int32_t idx = step_batch.n_tokens++;
+        step_batch.token[idx]     = pkt->draft_ids[u];
+        step_batch.pos[idx]       = (llama_pos)kv_pos;
+        step_batch.n_seq_id[idx]  = 1;
+        step_batch.seq_id[idx][0] = (llama_seq_id)u;
+        step_batch.logits[idx]    = 1;
+    };
+
+    step_batch.n_tokens = 0;
+    push_leaf(n_d1_a, 0);
+    if (n_d1_b >= 0) {
+        push_leaf((uint32_t)n_d1_b, 0);
+    }
+
+    if (llama_decode(draft_ctx, step_batch) != 0) {
+        llama_batch_free(step_batch);
+        return n_nodes;
+    }
+
+    // Depth 2: Expand top-1 (and top-2 if k_draft >= 4) from n_d1_a, plus top-1 from n_d1_b
+    const float * l_d1_a = llama_get_logits_ith(draft_ctx, 0);
+    sparse_prob_t q_sup1[TOP_S_SUPPORT];
+    uint8_t q_len1 = 0;
+    sample_branch_children(l_d1_a, n_vocab, temperature, min_p, rng, q_sup1, q_len1, t1, q1, t2, q2);
+
+    uint32_t n_d2_a = add_node((int8_t)n_d1_a, t1, q1, q_sup1, q_len1);
+    int32_t  n_d2_b = -1;
+    if (n_nodes < max_nodes && k_draft >= 4) {
+        n_d2_b = (int32_t)add_node((int8_t)n_d1_a, t2, q2, q_sup1, q_len1);
+    }
+
+    int32_t n_d2_c = -1;
+    if (n_nodes < max_nodes && n_d1_b >= 0) {
+        const float * l_d1_b = llama_get_logits_ith(draft_ctx, 1);
+        sparse_prob_t q_sup2[TOP_S_SUPPORT];
+        uint8_t q_len2 = 0;
+        int32_t b_t1 = 0, b_t2 = 0;
+        float b_q1 = 1.0f, b_q2 = 1.0f;
+        sample_branch_children(l_d1_b, n_vocab, temperature, min_p, rng, q_sup2, q_len2, b_t1, b_q1, b_t2, b_q2);
+        n_d2_c = (int32_t)add_node((int8_t)n_d1_b, b_t1, b_q1, q_sup2, q_len2);
+    }
+    (void)n_d2_c;
+
+    if (n_nodes >= max_nodes) {
+        llama_batch_free(step_batch);
+        return n_nodes;
+    }
+
+    // Depth 3: Batched decode of Depth 2 leaves (n_d2_a and n_d2_b)
+    step_batch.n_tokens = 0;
+    push_leaf(n_d2_a, (int32_t)n_d1_a);
+    if (n_d2_b >= 0) {
+        push_leaf((uint32_t)n_d2_b, (int32_t)n_d1_a);
+    }
+
+    if (llama_decode(draft_ctx, step_batch) == 0) {
+        const float * l_d2_a = llama_get_logits_ith(draft_ctx, 0);
+        sparse_prob_t q_sup3[TOP_S_SUPPORT];
+        uint8_t q_len3 = 0;
+        sample_branch_children(l_d2_a, n_vocab, temperature, min_p, rng, q_sup3, q_len3, t1, q1, t2, q2);
+        add_node((int8_t)n_d2_a, t1, q1, q_sup3, q_len3);
+
+        if (n_nodes < max_nodes && n_d2_b >= 0) {
+            const float * l_d2_b = llama_get_logits_ith(draft_ctx, 1);
+            sparse_prob_t q_sup4[TOP_S_SUPPORT];
+            uint8_t q_len4 = 0;
+            int32_t d_t1 = 0, d_t2 = 0;
+            float d_q1 = 1.0f, d_q2 = 1.0f;
+            sample_branch_children(l_d2_b, n_vocab, temperature, min_p, rng, q_sup4, q_len4, d_t1, d_q1, d_t2, d_q2);
+            add_node((int8_t)n_d2_b, d_t1, d_q1, q_sup4, q_len4);
+        } else if (n_nodes < max_nodes) {
+            add_node((int8_t)n_d2_a, t2, q2, q_sup3, q_len3);
         }
     }
 
@@ -994,6 +1118,7 @@ int main(int argc, char ** argv) {
             struct llama_context_params d_cparams = llama_context_default_params();
             d_cparams.n_ctx           = MAX_CTX;
             d_cparams.n_batch         = MAX_CTX;
+            d_cparams.n_seq_max       = MAX_B_VERIFY;
             d_cparams.n_threads       = std::max(4, n_threads);
             d_cparams.n_threads_batch = std::max(8, n_threads);
             draft_ctx = llama_init_from_model(draft_model, d_cparams);
@@ -1144,8 +1269,8 @@ int main(int argc, char ** argv) {
 
         printf("\n---\n[TP Phase 5 Stats] Generated %d tokens in %u decode steps (+ %u prefill steps) | %.2f ms/tok (%.2f tok/s)\n",
                generated, decode_steps, prefill_steps, (elapsed * 1000.0) / generated, tok_per_s);
-        printf("[Speculative Stats] Accepted %u/%u drafted tokens | Avg %.2f tokens/step | Final kv_commit_idx = %u\n",
-               total_accept, total_drafted, avg_tok_per_step, kv_commit_idx);
+        printf("[Speculative Stats] Accepted %u/%u drafted tokens ( Alt-Branch Hits: %u ) | Avg %.2f tokens/step | Final kv_commit_idx = %u\n",
+               total_accept, total_drafted, branch_hits, avg_tok_per_step, kv_commit_idx);
     }
 
     shmem_barrier_all();
