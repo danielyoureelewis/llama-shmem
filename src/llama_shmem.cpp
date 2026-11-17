@@ -627,7 +627,11 @@ static uint32_t propose_neural_draft(
             }
             batch.logits[i]   = (i == n_new - 1) ? 1 : 0;
         }
-        llama_decode(draft_ctx, batch);
+        if (llama_decode(draft_ctx, batch) != 0) {
+            fprintf(stderr, "[PE 0] Warning: draft history llama_decode failed!\n");
+            llama_batch_free(batch);
+            return 1;
+        }
         llama_batch_free(batch);
         draft_kv_len = target_len;
     }
