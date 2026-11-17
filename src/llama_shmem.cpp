@@ -539,6 +539,11 @@ static int32_t sample_from_logits(
 }
 
 // Helper: Sample up to 2 distinct child branches (top-1 and top-2) from draft logits
+// Track which tree nodes u had their KV state decoded into seq_id = u during the current step
+static bool     g_node_kv_valid[MAX_B_VERIFY] = { false };
+static uint32_t g_node_kv_len[MAX_B_VERIFY]   = { 0 };
+
+// Helper: Sample up to 2 distinct child branches (top-1 and top-2) from draft logits
 static void sample_branch_children(
     const float * logits,
     uint32_t n_vocab,
@@ -578,9 +583,30 @@ static void sample_branch_children(
         }
     }
 
-    // Select a distinct second branch from the remaining support (or fallback argmax)
     tok2 = (out_top_s[0].token_id != tok1) ? out_top_s[0].token_id : ((out_len > 1) ? out_top_s[1].token_id : (tok1 ^ 1));
     q2   = (out_top_s[0].token_id != tok1) ? out_top_s[0].prob     : ((out_len > 1) ? out_top_s[1].prob     : 1e-4f);
+}
+
+// Reuse any already-decoded branch sequence from the previous step to avoid re-decoding accepted tokens
+static void sync_drafter_winning_branch(
+    struct llama_context * draft_ctx,
+    uint32_t & draft_kv_len,
+    uint32_t n_comm,
+    const uint8_t accepted_slots[MAX_B_VERIFY]
+) {
+    if (!draft_ctx || n_comm <= 1) return;
+    llama_memory_t mem = llama_get_memory(draft_ctx);
+
+    // Find the deepest accepted slot that was actually decoded into its own KV sequence
+    for (int d = (int)n_comm - 1; d >= 1; --d) {
+        uint8_t slot = accepted_slots[d];
+        if (slot > 0 && slot < MAX_B_VERIFY && g_node_kv_valid[slot]) {
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_memory_seq_cp(mem, (llama_seq_id)slot, 0, -1, -1);
+            draft_kv_len = g_node_kv_len[slot];
+            break;
+        }
+    }
 }
 
 static uint32_t propose_neural_draft(
@@ -601,6 +627,11 @@ static uint32_t propose_neural_draft(
     pkt->pos[0]         = (int32_t)kv_commit_idx;
     pkt->parent_mask[0] = 1U;
 
+    for (int s = 0; s < MAX_B_VERIFY; ++s) {
+        g_node_kv_valid[s] = false;
+        g_node_kv_len[s]   = 0;
+    }
+
     if (k_draft <= 0 || !draft_ctx) {
         return 1;
     }
@@ -614,7 +645,7 @@ static uint32_t propose_neural_draft(
     }
     llama_memory_seq_rm(mem, 0, (llama_pos)draft_kv_len, -1);
 
-    // Sync any newly accepted tokens from history (including root_token at history.back()) into seq 0
+    // Decode only the un-cached tail of history into seq 0
     uint32_t target_len = (uint32_t)history.size();
     if (target_len > draft_kv_len) {
         uint32_t n_new = target_len - draft_kv_len;
@@ -646,7 +677,7 @@ static uint32_t propose_neural_draft(
         return u;
     };
 
-    // Depth 1: Sample top-1 (and top-2 if k_draft >= 2) from Root (node 0)
+    // Depth 1: Sample top-1 (and top-2 if k_draft >= 2) directly from Root logits (0 extra decode calls)
     const float * root_logits = llama_get_logits_ith(draft_ctx, -1);
     sparse_prob_t q_sup0[TOP_S_SUPPORT];
     uint8_t q_len0 = 0;
@@ -676,6 +707,8 @@ static uint32_t propose_neural_draft(
         step_batch.n_seq_id[idx]  = 1;
         step_batch.seq_id[idx][0] = (llama_seq_id)u;
         step_batch.logits[idx]    = 1;
+        g_node_kv_valid[u]        = true;
+        g_node_kv_len[u]          = (uint32_t)(kv_pos + 1);
     };
 
     step_batch.n_tokens = 0;
@@ -689,7 +722,7 @@ static uint32_t propose_neural_draft(
         return n_nodes;
     }
 
-    // Depth 2: Expand top-1 (and top-2 if k_draft >= 4) from n_d1_a, plus top-1 from n_d1_b
+    // Depth 2: Expand up to 2 children from n_d1_a and up to 2 children from n_d1_b (reaches 6 nodes in 1 batch!)
     const float * l_d1_a = llama_get_logits_ith(draft_ctx, 0);
     sparse_prob_t q_sup1[TOP_S_SUPPORT];
     uint8_t q_len1 = 0;
@@ -701,7 +734,6 @@ static uint32_t propose_neural_draft(
         n_d2_b = (int32_t)add_node((int8_t)n_d1_a, t2, q2, q_sup1, q_len1);
     }
 
-    int32_t n_d2_c = -1;
     if (n_nodes < max_nodes && n_d1_b >= 0) {
         const float * l_d1_b = llama_get_logits_ith(draft_ctx, 1);
         sparse_prob_t q_sup2[TOP_S_SUPPORT];
@@ -709,16 +741,18 @@ static uint32_t propose_neural_draft(
         int32_t b_t1 = 0, b_t2 = 0;
         float b_q1 = 1.0f, b_q2 = 1.0f;
         sample_branch_children(l_d1_b, n_vocab, temperature, min_p, rng, q_sup2, q_len2, b_t1, b_q1, b_t2, b_q2);
-        n_d2_c = (int32_t)add_node((int8_t)n_d1_b, b_t1, b_q1, q_sup2, q_len2);
+        add_node((int8_t)n_d1_b, b_t1, b_q1, q_sup2, q_len2);
+        if (n_nodes < max_nodes && k_draft == 5) {
+            add_node((int8_t)n_d1_b, b_t2, b_q2, q_sup2, q_len2);
+        }
     }
-    (void)n_d2_c;
 
     if (n_nodes >= max_nodes) {
         llama_batch_free(step_batch);
         return n_nodes;
     }
 
-    // Depth 3: Batched decode of Depth 2 leaves (n_d2_a and n_d2_b)
+    // Depth 3 (only for k_draft >= 6): Batched decode of Depth 2 leaves (n_d2_a and n_d2_b)
     step_batch.n_tokens = 0;
     push_leaf(n_d2_a, (int32_t)n_d1_a);
     if (n_d2_b >= 0) {
@@ -1119,8 +1153,8 @@ int main(int argc, char ** argv) {
             d_cparams.n_ctx           = MAX_CTX;
             d_cparams.n_batch         = MAX_CTX;
             d_cparams.n_seq_max       = MAX_B_VERIFY;
-            d_cparams.n_threads       = std::max(4, n_threads);
-            d_cparams.n_threads_batch = std::max(8, n_threads);
+            d_cparams.n_threads       = n_threads;
+            d_cparams.n_threads_batch = n_threads;
             draft_ctx = llama_init_from_model(draft_model, d_cparams);
             vocab     = llama_model_get_vocab(draft_model);
             printf("[PE 0] Loaded Neural Drafter (%s) with K_DRAFT=%d\n", draft_model_path, k_draft);
