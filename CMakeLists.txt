@@ -32,5 +32,6 @@ target_link_libraries(llama_shmem PRIVATE ${GGML_LIBS} pthread m)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/test_shmem_pipe.cpp")
     add_executable(test_shmem_pipe src/test_shmem_pipe.cpp)
-    target_link_libraries(test_shmem_pipe PRIVATE pthread m)
+    target_include_directories(test_shmem_pipe PRIVATE ${LLAMA_INCLUDE_DIR})
+    target_link_libraries(test_shmem_pipe PRIVATE ${GGML_LIBS} pthread m)
 endif()

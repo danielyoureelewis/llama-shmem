@@ -338,7 +338,6 @@ static struct ggml_tensor * load_gguf_tensor_row_shard(
     ggml_set_name(t, name.c_str());
 
     const struct ggml_type_traits * qtraits = ggml_get_type_traits(meta->type);
-    const struct ggml_type_traits_cpu * qtraits_cpu = ggml_get_type_traits_cpu(meta->type);
     const struct ggml_type_traits_cpu * q8_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
 
     size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, ne0_local);
