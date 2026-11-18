@@ -28,6 +28,7 @@
 #define MAX_D_MODEL   8192
 #define MAX_CTX       2048
 #define MAX_LOG2_PES  6   // Supports up to 2^6 = 64 PEs in Butterfly AllReduce
+#define MAX_PES       (1 << MAX_LOG2_PES)
 
 struct sparse_prob_t {
     int32_t token_id;
@@ -67,8 +68,8 @@ struct logit_cand_t {
 struct __attribute__((aligned(64))) shmem_tp_sync_t {
     float         stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
     unsigned long stage_ready_seq[2][MAX_LOG2_PES];
-    logit_cand_t  peer_top_logits[8][MAX_B_VERIFY][TOP_S_SUPPORT];
-    unsigned long logits_ready_seq[8];
+    logit_cand_t  peer_top_logits[MAX_PES][MAX_B_VERIFY][TOP_S_SUPPORT];
+    unsigned long logits_ready_seq[MAX_PES];
 };
 
 static shmem_spec_packet_t * sym_slot = nullptr;
@@ -138,20 +139,29 @@ void shmem_op_tp_allreduce(struct ggml_tensor * dst, const struct ggml_tensor * 
 }
 
 struct sharded_layer_t {
-    struct ggml_tensor * attn_norm = nullptr;
-    struct ggml_tensor * wq        = nullptr;
-    struct ggml_tensor * wk        = nullptr;
-    struct ggml_tensor * wv        = nullptr;
-    struct ggml_tensor * wo        = nullptr;
-    struct ggml_tensor * bq        = nullptr;
-    struct ggml_tensor * bk        = nullptr;
-    struct ggml_tensor * bv        = nullptr;
-    struct ggml_tensor * ffn_norm  = nullptr;
-    struct ggml_tensor * ffn_gate  = nullptr;
-    struct ggml_tensor * ffn_up    = nullptr;
-    struct ggml_tensor * ffn_down  = nullptr;
-    struct ggml_tensor * k_cache   = nullptr;
-    struct ggml_tensor * v_cache   = nullptr;
+    struct ggml_tensor * attn_norm      = nullptr;
+    struct ggml_tensor * wq             = nullptr;
+    struct ggml_tensor * wk             = nullptr;
+    struct ggml_tensor * wv             = nullptr;
+    struct ggml_tensor * wo             = nullptr;
+    struct ggml_tensor * bq             = nullptr;
+    struct ggml_tensor * bk             = nullptr;
+    struct ggml_tensor * bv             = nullptr;
+    struct ggml_tensor * ffn_norm       = nullptr;
+    struct ggml_tensor * ffn_gate       = nullptr;
+    struct ggml_tensor * ffn_up         = nullptr;
+    struct ggml_tensor * ffn_down       = nullptr;
+    // DeepSeek / MoE Expert-Parallel (EP) + Shared Expert tensors
+    struct ggml_tensor * ffn_gate_inp   = nullptr; // Router [n_embd, n_experts] (replicated)
+    struct ggml_tensor * exp_probs_b    = nullptr; // Router bias [n_experts] (DeepSeek-V3 auxiliary-loss-free bias)
+    struct ggml_tensor * ffn_gate_exps  = nullptr; // 3D Routed Gate [n_embd, moe_n_ff, n_experts_local]
+    struct ggml_tensor * ffn_up_exps    = nullptr; // 3D Routed Up   [n_embd, moe_n_ff, n_experts_local]
+    struct ggml_tensor * ffn_down_exps  = nullptr; // 3D Routed Down [moe_n_ff, n_embd, n_experts_local]
+    struct ggml_tensor * ffn_gate_shexp = nullptr; // TP Col-Sharded Shared Expert Gate
+    struct ggml_tensor * ffn_up_shexp   = nullptr; // TP Col-Sharded Shared Expert Up
+    struct ggml_tensor * ffn_down_shexp = nullptr; // TP Row-Sharded Shared Expert Down
+    struct ggml_tensor * k_cache        = nullptr;
+    struct ggml_tensor * v_cache        = nullptr;
 };
 
 struct sharded_model_t {
@@ -167,9 +177,17 @@ struct sharded_model_t {
 
     uint32_t n_head_local;
     uint32_t n_head_kv_local;
+    uint32_t kv_shard_idx;
     uint32_t n_ff_local;
     uint32_t vocab_offset;
     uint32_t vocab_count;
+
+    // DeepSeek MoE Expert-Parallel metadata
+    uint32_t n_experts       = 0;
+    uint32_t n_experts_used  = 0;
+    uint32_t n_experts_local = 0;
+    uint32_t expert_offset   = 0;
+    uint32_t n_ff_exp        = 0;
 
     float    rms_eps;
     float    rope_freq_base;
@@ -292,7 +310,70 @@ static struct ggml_tensor * load_gguf_tensor_col_shard(
     return t;
 }
 
-// Row-Parallel Loader with Automatic Q8_0 Repacking when ne0_local is not a multiple of 256 (e.g. 32B at TP=8)
+// GQA / MLA KV-Head Loader: supports both disjoint KV sharding (n_pes <= n_head_kv)
+// and automatic KV-head replication when n_pes > n_head_kv (e.g. 70B/72B at TP=16 or DeepSeek MLA).
+static struct ggml_tensor * load_gguf_tensor_kv_shard(
+    int fd,
+    struct gguf_context * gguf_ctx,
+    struct ggml_context * meta_ctx,
+    struct ggml_context * dst_ctx,
+    const std::string & name,
+    uint32_t kv_shard_idx,
+    uint32_t n_kv_shards,
+    size_t & total_bytes_loaded
+) {
+    return load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, dst_ctx, name, (int)kv_shard_idx, (int)n_kv_shards, total_bytes_loaded);
+}
+
+// 3D Expert-Parallel (EP) GGUF Tensor Loader for DeepSeek / MoE Architectures:
+// Slices 3D fused expert tensors [ne0, ne1, n_experts] along ne[2] so each PE loads
+// n_experts_local complete experts in native Q4_K/Q6_K quantization with zero super-block splitting!
+static struct ggml_tensor * load_gguf_tensor_expert_shard(
+    int fd,
+    struct gguf_context * gguf_ctx,
+    struct ggml_context * meta_ctx,
+    struct ggml_context * dst_ctx,
+    const std::string & name,
+    int my_pe,
+    int n_pes,
+    size_t & total_bytes_loaded
+) {
+    int idx = gguf_find_tensor(gguf_ctx, name.c_str());
+    if (idx < 0) return nullptr;
+
+    struct ggml_tensor * meta = ggml_get_tensor(meta_ctx, name.c_str());
+    if (ggml_n_dims(meta) < 3) {
+        fprintf(stderr, "[PE %d] Warning: Expected 3D expert tensor for %s, got %dD\n",
+                my_pe, name.c_str(), ggml_n_dims(meta));
+        return nullptr;
+    }
+
+    int64_t ne0 = meta->ne[0];
+    int64_t ne1 = meta->ne[1];
+    int64_t n_experts = meta->ne[2];
+    if (n_experts % n_pes != 0) {
+        fprintf(stderr, "[PE %d] Fatal: n_experts (%lld) in %s must be divisible by n_pes (%d)\n",
+                my_pe, (long long)n_experts, name.c_str(), n_pes);
+        exit(1);
+    }
+
+    int64_t n_exp_local = n_experts / n_pes;
+    struct ggml_tensor * t = ggml_new_tensor_3d(dst_ctx, meta->type, ne0, ne1, n_exp_local);
+    ggml_set_name(t, name.c_str());
+
+    size_t nbytes       = ggml_nbytes(t);
+    size_t base_offset  = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, idx);
+    size_t shard_offset = base_offset + (size_t)my_pe * nbytes;
+
+    if (pread(fd, t->data, nbytes, (off_t)shard_offset) != (ssize_t)nbytes) {
+        fprintf(stderr, "[PE %d] Failed reading 3D MoE expert shard %s\n", my_pe, name.c_str());
+        exit(1);
+    }
+    total_bytes_loaded += nbytes;
+    return t;
+}
+
+// Streaming Row-Parallel Loader with Zero Full-Tensor RAM Spike and Automatic Q8_0 Repacking
 static struct ggml_tensor * load_gguf_tensor_row_shard(
     int fd,
     struct gguf_context * gguf_ctx,
@@ -314,15 +395,9 @@ static struct ggml_tensor * load_gguf_tensor_row_shard(
     size_t full_row_bytes = ggml_row_size(meta->type, ne0_full);
     size_t base_offset    = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, idx);
 
-    std::vector<uint8_t> tmp(full_row_bytes * ne1);
-    if (pread(fd, tmp.data(), tmp.size(), (off_t)base_offset) != (ssize_t)tmp.size()) {
-        fprintf(stderr, "[PE %d] Failed reading row shard %s\n", my_pe, name.c_str());
-        exit(1);
-    }
-
     int64_t blck_size = ggml_blck_size(meta->type);
     if (ne0_local % blck_size == 0) {
-        // Direct zero-conversion quantized block slicing
+        // Direct zero-conversion quantized block slicing: pread() only our local column slice per row!
         struct ggml_tensor * t = ggml_new_tensor_2d(dst_ctx, meta->type, ne0_local, ne1);
         ggml_set_name(t, name.c_str());
         size_t local_row_bytes = ggml_row_size(meta->type, ne0_local);
@@ -330,16 +405,18 @@ static struct ggml_tensor * load_gguf_tensor_row_shard(
         size_t col_byte_offset = (size_t)my_pe * local_row_bytes;
 
         for (int64_t r = 0; r < ne1; ++r) {
-            memcpy(dst_ptr + r * local_row_bytes,
-                   tmp.data() + r * full_row_bytes + col_byte_offset,
-                   local_row_bytes);
+            off_t row_off = (off_t)(base_offset + (size_t)r * full_row_bytes + col_byte_offset);
+            if (pread(fd, dst_ptr + (size_t)r * local_row_bytes, local_row_bytes, row_off) != (ssize_t)local_row_bytes) {
+                fprintf(stderr, "[PE %d] Failed streaming row %lld of %s\n", my_pe, (long long)r, name.c_str());
+                exit(1);
+            }
         }
         total_bytes_loaded += ggml_nbytes(t);
         return t;
     }
 
     // Fallback for sub-256 block boundaries (e.g., Qwen2.5-32B on 8 nodes where ne0_local = 640 or 3456):
-    // Dequantize full row to F32, slice local columns [my_pe * ne0_local ..], and quantize to Q8_0 (block_size = 32)
+    // Stream 1 row at a time into a tiny single-row buffer, dequantize to F32, and pack into Q8_0 (block_size = 32)
     if (ne0_local % 32 != 0) {
         fprintf(stderr, "[PE %d] Fatal: Tensor %s ne0_local (%lld) not divisible by 32!\n",
                 my_pe, name.c_str(), (long long)ne0_local);
@@ -354,15 +431,20 @@ static struct ggml_tensor * load_gguf_tensor_row_shard(
 
     size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, ne0_local);
     uint8_t * dst_ptr = (uint8_t *)t->data;
-    std::vector<float> f32_row(ne0_full);
+    std::vector<uint8_t> row_buf(full_row_bytes);
+    std::vector<float>   f32_row(ne0_full);
     size_t col_elem_offset = (size_t)my_pe * ne0_local;
 
     for (int64_t r = 0; r < ne1; ++r) {
-        qtraits->to_float(tmp.data() + r * full_row_bytes, f32_row.data(), ne0_full);
-        q8_cpu->from_float(f32_row.data() + col_elem_offset, dst_ptr + r * q8_row_bytes, ne0_local);
+        off_t row_off = (off_t)(base_offset + (size_t)r * full_row_bytes);
+        if (pread(fd, row_buf.data(), full_row_bytes, row_off) != (ssize_t)full_row_bytes) {
+            fprintf(stderr, "[PE %d] Failed reading row %lld of %s for Q8_0 repack\n", my_pe, (long long)r, name.c_str());
+            exit(1);
+        }
+        qtraits->to_float(row_buf.data(), f32_row.data(), ne0_full);
+        q8_cpu->from_float(f32_row.data() + col_elem_offset, dst_ptr + (size_t)r * q8_row_bytes, ne0_local);
     }
 
-    (void)qtraits;
     total_bytes_loaded += ggml_nbytes(t);
     return t;
 }
@@ -385,19 +467,48 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     m.n_head_kv      = gguf_get_u32_suffix(gguf_ctx, ".attention.head_count_kv", m.n_head);
     m.n_layer        = gguf_get_u32_suffix(gguf_ctx, ".block_count");
     m.n_ff           = gguf_get_u32_suffix(gguf_ctx, ".feed_forward_length");
+    m.n_experts      = gguf_get_u32_suffix(gguf_ctx, ".expert_count", 0);
+    m.n_experts_used = gguf_get_u32_suffix(gguf_ctx, ".expert_used_count", 0);
+    m.n_ff_exp       = gguf_get_u32_suffix(gguf_ctx, ".expert_feed_forward_length", 0);
     m.rms_eps        = gguf_get_f32_suffix(gguf_ctx, ".attention.layer_norm_rms_epsilon", 1e-5f);
     m.rope_freq_base = gguf_get_f32_suffix(gguf_ctx, ".rope.freq_base", 10000.0f);
     m.rope_type      = (strcmp(arch, "qwen2") == 0) ? 2 : 0;
 
-    if (m.n_head % m.n_pes != 0 || m.n_head_kv % m.n_pes != 0) {
-        fprintf(stderr, "[PE %d] Error: n_head (%u) and n_head_kv (%u) must be divisible by n_pes (%d)\n",
-                m.my_pe, m.n_head, m.n_head_kv, m.n_pes);
+    if (m.n_head % m.n_pes != 0) {
+        fprintf(stderr, "[PE %d] Error: n_head (%u) must be divisible by n_pes (%d)\n",
+                m.my_pe, m.n_head, m.n_pes);
         exit(1);
     }
 
-    m.n_head_local    = m.n_head / m.n_pes;
-    m.n_head_kv_local = m.n_head_kv / m.n_pes;
-    m.n_ff_local      = m.n_ff / m.n_pes;
+    uint32_t n_kv_shards = m.n_pes;
+    if ((uint32_t)m.n_pes <= m.n_head_kv) {
+        if (m.n_head_kv % m.n_pes != 0) {
+            fprintf(stderr, "[PE %d] Error: n_head_kv (%u) must be divisible by n_pes (%d)\n",
+                    m.my_pe, m.n_head_kv, m.n_pes);
+            exit(1);
+        }
+        m.n_head_kv_local = m.n_head_kv / m.n_pes;
+        m.kv_shard_idx    = (uint32_t)m.my_pe;
+        n_kv_shards       = (uint32_t)m.n_pes;
+    } else {
+        // GQA / MLA KV-Head Replication when n_pes > n_head_kv (e.g. 72B at TP=16 or DeepSeek MLA)
+        if (m.n_pes % m.n_head_kv != 0) {
+            fprintf(stderr, "[PE %d] Error: When n_pes (%d) > n_head_kv (%u), n_pes must be a multiple of n_head_kv\n",
+                    m.my_pe, m.n_pes, m.n_head_kv);
+            exit(1);
+        }
+        m.n_head_kv_local = 1;
+        uint32_t pes_per_kv = (uint32_t)m.n_pes / m.n_head_kv;
+        m.kv_shard_idx    = (uint32_t)m.my_pe / pes_per_kv;
+        n_kv_shards       = m.n_head_kv;
+    }
+
+    m.n_head_local = m.n_head / m.n_pes;
+    m.n_ff_local   = m.n_ff / m.n_pes;
+    if (m.n_experts > 0) {
+        m.n_experts_local = m.n_experts / (uint32_t)m.n_pes;
+        m.expert_offset   = (uint32_t)m.my_pe * m.n_experts_local;
+    }
 
     struct ggml_tensor * embd_meta = ggml_get_tensor(meta_ctx, "token_embd.weight");
     m.n_vocab = embd_meta->ne[1];
@@ -441,18 +552,28 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
 
         l.attn_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_norm.weight", bytes_loaded);
         l.wq        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_q.weight", m.my_pe, m.n_pes, bytes_loaded);
-        l.wk        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_k.weight", m.my_pe, m.n_pes, bytes_loaded);
-        l.wv        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v.weight", m.my_pe, m.n_pes, bytes_loaded);
+        l.wk        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_k.weight", m.kv_shard_idx, n_kv_shards, bytes_loaded);
+        l.wv        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v.weight", m.kv_shard_idx, n_kv_shards, bytes_loaded);
         l.wo        = load_gguf_tensor_row_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_output.weight", m.my_pe, m.n_pes, bytes_loaded);
 
         l.bq        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_q.bias", m.my_pe, m.n_pes, bytes_loaded);
-        l.bk        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_k.bias", m.my_pe, m.n_pes, bytes_loaded);
-        l.bv        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v.bias", m.my_pe, m.n_pes, bytes_loaded);
+        l.bk        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_k.bias", m.kv_shard_idx, n_kv_shards, bytes_loaded);
+        l.bv        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v.bias", m.kv_shard_idx, n_kv_shards, bytes_loaded);
 
         l.ffn_norm  = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_norm.weight", bytes_loaded);
         l.ffn_gate  = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_gate.weight", m.my_pe, m.n_pes, bytes_loaded);
         l.ffn_up    = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_up.weight", m.my_pe, m.n_pes, bytes_loaded);
         l.ffn_down  = load_gguf_tensor_row_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_down.weight", m.my_pe, m.n_pes, bytes_loaded);
+
+        // DeepSeek / MoE Expert-Parallel (EP) + Shared Expert tensors (automatically loaded when present in GGUF)
+        l.ffn_gate_inp   = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_gate_inp.weight", bytes_loaded);
+        l.exp_probs_b    = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "exp_probs_b.bias", bytes_loaded);
+        l.ffn_gate_exps  = load_gguf_tensor_expert_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_gate_exps.weight", m.my_pe, m.n_pes, bytes_loaded);
+        l.ffn_up_exps    = load_gguf_tensor_expert_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_up_exps.weight", m.my_pe, m.n_pes, bytes_loaded);
+        l.ffn_down_exps  = load_gguf_tensor_expert_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_down_exps.weight", m.my_pe, m.n_pes, bytes_loaded);
+        l.ffn_gate_shexp = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_gate_shexp.weight", m.my_pe, m.n_pes, bytes_loaded);
+        l.ffn_up_shexp   = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_up_shexp.weight", m.my_pe, m.n_pes, bytes_loaded);
+        l.ffn_down_shexp = load_gguf_tensor_row_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_down_shexp.weight", m.my_pe, m.n_pes, bytes_loaded);
     }
 
     close(fd);
