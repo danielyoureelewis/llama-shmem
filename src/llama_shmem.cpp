@@ -769,9 +769,112 @@ static uint32_t propose_neural_draft(
     return n_nodes;
 }
 
+// Fast O(N_PES * TOP_S_SUPPORT) = O(128) sampler over pre-extracted per-PE top candidates (eliminates 152K vocab scan & 4.8MB buffer on PE 0)
+static int32_t sample_from_top_candidates(
+    uint32_t tok_slot,
+    int n_pes,
+    float temperature,
+    float min_p,
+    splitmix64_t & rng,
+    sparse_prob_t out_top_s[TOP_S_SUPPORT],
+    uint8_t & out_len
+) {
+    if (temperature <= 0.0f) {
+        int32_t best_id  = 0;
+        float   best_val = -INFINITY;
+        for (int pe = 0; pe < n_pes; ++pe) {
+            const logit_cand_t * cands = sym_tp->peer_top_logits[pe][tok_slot];
+            for (int k = 0; k < TOP_S_SUPPORT; ++k) {
+                if (cands[k].token_id >= 0 && cands[k].logit > best_val) {
+                    best_val = cands[k].logit;
+                    best_id  = cands[k].token_id;
+                }
+            }
+        }
+        out_len = 1;
+        out_top_s[0] = { best_id, 1.0f };
+        return best_id;
+    }
+
+    sparse_prob_t heap[TOP_S_SUPPORT];
+    uint32_t h_sz = 0;
+    for (int pe = 0; pe < n_pes; ++pe) {
+        const logit_cand_t * cands = sym_tp->peer_top_logits[pe][tok_slot];
+        for (int k = 0; k < TOP_S_SUPPORT; ++k) {
+            if (cands[k].token_id < 0) continue;
+            float val = cands[k].logit;
+            if (h_sz < TOP_S_SUPPORT) {
+                heap[h_sz++] = { cands[k].token_id, val };
+                if (h_sz == TOP_S_SUPPORT) {
+                    for (int i = (TOP_S_SUPPORT / 2) - 1; i >= 0; --i) {
+                        int p = i;
+                        while (true) {
+                            int l = 2 * p + 1, r = 2 * p + 2, sm = p;
+                            if (l < TOP_S_SUPPORT && heap[l].prob < heap[sm].prob) sm = l;
+                            if (r < TOP_S_SUPPORT && heap[r].prob < heap[sm].prob) sm = r;
+                            if (sm == p) break;
+                            std::swap(heap[p], heap[sm]);
+                            p = sm;
+                        }
+                    }
+                }
+            } else if (val > heap[0].prob) {
+                heap[0] = { cands[k].token_id, val };
+                int p = 0;
+                while (true) {
+                    int l = 2 * p + 1, r = 2 * p + 2, sm = p;
+                    if (l < TOP_S_SUPPORT && heap[l].prob < heap[sm].prob) sm = l;
+                    if (r < TOP_S_SUPPORT && heap[r].prob < heap[sm].prob) sm = r;
+                    if (sm == p) break;
+                    std::swap(heap[p], heap[sm]);
+                    p = sm;
+                }
+            }
+        }
+    }
+
+    std::sort(heap, heap + h_sz, [](const sparse_prob_t & a, const sparse_prob_t & b) {
+        return a.prob > b.prob;
+    });
+
+    float max_l = heap[0].prob;
+    float sum_exp = 0.0f;
+    for (uint32_t i = 0; i < h_sz; ++i) {
+        heap[i].prob = expf((heap[i].prob - max_l) / temperature);
+        sum_exp += heap[i].prob;
+    }
+    for (uint32_t i = 0; i < h_sz; ++i) {
+        heap[i].prob /= sum_exp;
+    }
+
+    float p_max  = heap[0].prob;
+    float thresh = min_p * p_max;
+    uint8_t p_len = 0;
+    float renorm = 0.0f;
+    for (uint32_t i = 0; i < h_sz; ++i) {
+        if (i == 0 || heap[i].prob >= thresh) {
+            out_top_s[p_len++] = heap[i];
+            renorm += heap[i].prob;
+        }
+    }
+    for (uint8_t i = 0; i < p_len; ++i) {
+        out_top_s[i].prob /= renorm;
+    }
+    out_len = p_len;
+
+    float r = rng.next_f32();
+    float cdf = 0.0f;
+    for (uint8_t i = 0; i < p_len; ++i) {
+        cdf += out_top_s[i].prob;
+        if (r <= cdf || i + 1 == p_len) {
+            return out_top_s[i].token_id;
+        }
+    }
+    return out_top_s[0].token_id;
+}
+
 static void verify_tree_local(
-    const float * logits_all,
-    uint32_t n_vocab,
+    int n_pes,
     uint32_t n_tokens,
     float temp,
     float min_p,
@@ -786,10 +889,9 @@ static void verify_tree_local(
     accepted_slots[0] = 0;
 
     while (true) {
-        const float * row = logits_all + (size_t)cur_node * n_vocab;
         sparse_prob_t p_sup[TOP_S_SUPPORT];
         uint8_t p_len = 0;
-        int32_t greedy_or_init = sample_from_logits(row, n_vocab, temp, min_p, rng, p_sup, p_len);
+        int32_t greedy_or_init = sample_from_top_candidates(cur_node, n_pes, temp, min_p, rng, p_sup, p_len);
 
         uint32_t children[MAX_B_VERIFY];
         uint32_t n_children = 0;
@@ -1059,25 +1161,38 @@ static bool evaluate_tp_step(
     const size_t   tok_start    = sym_slot->is_decode ? 0 : (size_t)(n_tokens - 1);
     const float *  local_logits = (const float *)cur->data + tok_start * (size_t)m.vocab_count;
 
-    // Every PE extracts its local Top-S (32) candidates per token in parallel (O(V/P) scan, 256 bytes/tok)
+    // Fast local Top-S (or Top-1 in greedy mode) extraction per token
+    const bool is_greedy = (sym_slot->temperature <= 0.0f);
     for (uint32_t t = 0; t < n_eval_toks; ++t) {
         const float * row = local_logits + (size_t)t * m.vocab_count;
         logit_cand_t * top_k = sym_tp->peer_top_logits[m.my_pe][t];
         for (int k = 0; k < TOP_S_SUPPORT; ++k) {
             top_k[k] = { -1, -INFINITY };
         }
-        float min_top = -INFINITY;
-        int   min_idx = 0;
-        for (uint32_t v = 0; v < m.vocab_count; ++v) {
-            float val = row[v];
-            if (val > min_top) {
-                top_k[min_idx] = { (int32_t)(m.vocab_offset + v), val };
-                min_top = top_k[0].logit;
-                min_idx = 0;
-                for (int k = 1; k < TOP_S_SUPPORT; ++k) {
-                    if (top_k[k].logit < min_top) {
-                        min_top = top_k[k].logit;
-                        min_idx = k;
+        if (is_greedy) {
+            float best_val = row[0];
+            uint32_t best_v = 0;
+            for (uint32_t v = 1; v < m.vocab_count; ++v) {
+                if (row[v] > best_val) {
+                    best_val = row[v];
+                    best_v   = v;
+                }
+            }
+            top_k[0] = { (int32_t)(m.vocab_offset + best_v), best_val };
+        } else {
+            float min_top = -INFINITY;
+            int   min_idx = 0;
+            for (uint32_t v = 0; v < m.vocab_count; ++v) {
+                float val = row[v];
+                if (val > min_top) {
+                    top_k[min_idx] = { (int32_t)(m.vocab_offset + v), val };
+                    min_top = top_k[0].logit;
+                    min_idx = 0;
+                    for (int k = 1; k < TOP_S_SUPPORT; ++k) {
+                        if (top_k[k].logit < min_top) {
+                            min_top = top_k[k].logit;
+                            min_idx = k;
+                        }
                     }
                 }
             }
@@ -1099,51 +1214,23 @@ static bool evaluate_tp_step(
         shmem_ulong_put_nbi(&sym_tp->logits_ready_seq[m.my_pe], &l_seq, 1, 0);
         shmem_quiet();
     } else {
-        static std::vector<float> full_logits_buf;
-        static std::vector<int32_t> touched_ids;
-        if (full_logits_buf.size() < (size_t)MAX_B_VERIFY * (size_t)m.n_vocab) {
-            full_logits_buf.assign((size_t)MAX_B_VERIFY * (size_t)m.n_vocab, -INFINITY);
-        } else {
-            for (int32_t idx : touched_ids) {
-                full_logits_buf[idx] = -INFINITY;
-            }
-            touched_ids.clear();
-        }
-
         for (int pe = 1; pe < m.n_pes; ++pe) {
             shmem_ulong_wait_until(&sym_tp->logits_ready_seq[pe], SHMEM_CMP_GE, l_seq);
         }
 
-        // Scatter the 4 * 32 = 128 global top candidates per token into full_logits_buf in O(1)
-        for (int pe = 0; pe < m.n_pes; ++pe) {
-            for (uint32_t t = 0; t < n_eval_toks; ++t) {
-                uint32_t dst_tok = sym_slot->is_decode ? t : (n_tokens - 1);
-                const logit_cand_t * cands = sym_tp->peer_top_logits[pe][t];
-                for (int k = 0; k < TOP_S_SUPPORT; ++k) {
-                    if (cands[k].token_id >= 0) {
-                        int32_t flat_idx = (int32_t)((size_t)dst_tok * m.n_vocab + (uint32_t)cands[k].token_id);
-                        full_logits_buf[flat_idx] = cands[k].logit;
-                        touched_ids.push_back(flat_idx);
-                    }
-                }
-            }
-        }
-
-        const float * logits_all = full_logits_buf.data();
-        const float temp         = sym_slot->temperature;
-        const float min_p        = sym_slot->min_p;
+        const float temp  = sym_slot->temperature;
+        const float min_p = sym_slot->min_p;
         splitmix64_t tail_rng(sym_slot->rng_seed);
 
         if (!sym_slot->is_decode) {
-            const float * last_logits = logits_all + (size_t)(n_tokens - 1) * m.n_vocab;
             sparse_prob_t dummy_sup[TOP_S_SUPPORT];
             uint8_t dummy_len = 0;
             out_n_accepted    = 0;
             out_n_committed   = 1;
             accepted_slots[0] = 0;
-            committed_ids[0]  = sample_from_logits(last_logits, m.n_vocab, temp, min_p, tail_rng, dummy_sup, dummy_len);
+            committed_ids[0]  = sample_from_top_candidates(0, m.n_pes, temp, min_p, tail_rng, dummy_sup, dummy_len);
         } else {
-            verify_tree_local(logits_all, m.n_vocab, n_tokens, temp, min_p, tail_rng,
+            verify_tree_local(m.n_pes, n_tokens, temp, min_p, tail_rng,
                               out_n_accepted, out_n_committed, committed_ids, accepted_slots);
         }
     }
