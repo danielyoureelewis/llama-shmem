@@ -609,11 +609,33 @@ static uint32_t propose_neural_draft(
     const uint32_t max_nodes = (uint32_t)(1 + k_draft);
     llama_memory_t mem = llama_get_memory(draft_ctx);
 
-    // Trim any speculative tokens from the previous step at pos >= draft_kv_len on seq 0
-    llama_memory_seq_rm(mem, 0, (llama_pos)draft_kv_len, -1);
+    // Track exact token IDs materialized in draft_ctx KV cache (including speculative forward tokens)
+    // so accepted primary-branch tokens are reused in-place without calling seq_rm + re-decoding them.
+    static std::vector<int32_t> draft_kv_tokens;
 
-    // Sync newly committed history tokens into seq 0
     uint32_t target_len = (uint32_t)history.size();
+    if (draft_kv_len == 0 && !draft_kv_tokens.empty()) {
+        draft_kv_tokens.clear();
+    }
+
+    uint32_t match_len = 0;
+    uint32_t max_check = std::min((uint32_t)draft_kv_tokens.size(), target_len);
+    while (match_len < max_check && draft_kv_tokens[match_len] == history[match_len]) {
+        match_len++;
+    }
+
+    // Ensure at least the final token (target_len - 1) is decoded so llama_get_logits_ith(draft_ctx, -1) has Root's logits
+    if (match_len == target_len && match_len > 0) {
+        match_len--;
+    }
+
+    if (match_len < (uint32_t)draft_kv_tokens.size()) {
+        llama_memory_seq_rm(mem, 0, (llama_pos)match_len, -1);
+        draft_kv_tokens.resize(match_len);
+    }
+    draft_kv_len = match_len;
+
+    // Sync only the uncached tail of history into seq 0
     if (target_len > draft_kv_len) {
         uint32_t n_new = target_len - draft_kv_len;
         llama_batch batch = llama_batch_init((int32_t)n_new, 0, 1);
@@ -630,6 +652,9 @@ static uint32_t propose_neural_draft(
             return 1;
         }
         llama_batch_free(batch);
+        for (uint32_t i = 0; i < n_new; ++i) {
+            draft_kv_tokens.push_back(history[draft_kv_len + i]);
+        }
         draft_kv_len = target_len;
     }
 
@@ -675,9 +700,11 @@ static uint32_t propose_neural_draft(
     // and attach both its top-1 and top-2 children (2 tree nodes per single-token decode, 0 rewinds!)
     uint32_t cur_kv_pos = draft_kv_len;
     while (n_nodes < max_nodes) {
-        if (!decode_forward(pkt->draft_ids[cur_primary], cur_kv_pos)) {
+        int32_t fwd_tok = pkt->draft_ids[cur_primary];
+        if (!decode_forward(fwd_tok, cur_kv_pos)) {
             break;
         }
+        draft_kv_tokens.push_back(fwd_tok);
         cur_kv_pos++;
         cur_logits = llama_get_logits_ith(draft_ctx, -1);
         sample_branch_children(cur_logits, n_vocab, temperature, min_p, rng, q_sup, q_len, t1, q1, t2, q2);
