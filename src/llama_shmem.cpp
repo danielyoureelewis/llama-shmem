@@ -485,6 +485,11 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     m.n_head         = gguf_get_u32_suffix(gguf_ctx, ".attention.head_count");
     m.n_head_kv      = gguf_get_u32_suffix(gguf_ctx, ".attention.head_count_kv", m.n_head);
     m.n_layer        = gguf_get_u32_suffix(gguf_ctx, ".block_count");
+    while (m.n_layer > 0) {
+        std::string probe = "blk." + std::to_string(m.n_layer - 1) + ".attn_norm.weight";
+        if (gguf_find_tensor(gguf_ctx, probe.c_str()) >= 0) break;
+        m.n_layer--;
+    }
     m.n_ff           = gguf_get_u32_suffix(gguf_ctx, ".feed_forward_length");
     m.n_experts      = gguf_get_u32_suffix(gguf_ctx, ".expert_count", 0);
     m.n_experts_used = gguf_get_u32_suffix(gguf_ctx, ".expert_used_count", 0);
@@ -632,6 +637,12 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
         l.ffn_gate_shexp = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_gate_shexp.weight", m.my_pe, m.n_pes, bytes_loaded);
         l.ffn_up_shexp   = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_up_shexp.weight", m.my_pe, m.n_pes, bytes_loaded);
         l.ffn_down_shexp = load_gguf_tensor_row_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "ffn_down_shexp.weight", m.my_pe, m.n_pes, bytes_loaded);
+    }
+
+    if (m.is_mla && !m.layers.empty() && m.layers[0].wk_b && m.layers[0].wv_b) {
+        m.qk_nope_dim = (uint32_t)m.layers[0].wk_b->ne[0];
+        m.kv_lora_rank = (uint32_t)m.layers[0].wk_b->ne[1];
+        m.v_head_dim  = (uint32_t)m.layers[0].wv_b->ne[1];
     }
 
     close(fd);
@@ -1267,13 +1278,10 @@ void shmem_op_local_moe(
     const bool     has_bias        = (l.exp_probs_b != nullptr);
     const float *  bias_ptr        = has_bias ? (const float *)l.exp_probs_b->data : nullptr;
 
+    if (ith != 0) return;
     float * dst_data = (float *)dst->data;
     const size_t total_dst_floats = (size_t)n_embd * n_tokens;
-    const size_t zero_start = (total_dst_floats * (size_t)ith) / (size_t)nth;
-    const size_t zero_end   = (total_dst_floats * (size_t)(ith + 1)) / (size_t)nth;
-    for (size_t i = zero_start; i < zero_end; ++i) {
-        dst_data[i] = 0.0f;
-    }
+    memset(dst_data, 0, total_dst_floats * sizeof(float));
 
     const struct ggml_type_traits_cpu * gate_traits = ggml_get_type_traits_cpu(l.ffn_gate_exps->type);
     const struct ggml_type_traits_cpu * down_traits = ggml_get_type_traits_cpu(l.ffn_down_exps->type);
@@ -1360,10 +1368,6 @@ void shmem_op_local_moe(
             uint32_t local_e = e - exp_start;
             float    weight  = top_w[k] * norm_scale;
 
-            // Each thread computes the entire expert for its assigned subset of tokens or rows;
-            // to avoid internal thread barriers inside custom2, partition experts across threads (k % nth == ith)!
-            if ((int)(k % (uint32_t)nth) != ith) continue;
-
             eval_quant_mat_vec(l.ffn_gate_exps, local_e, x_t, x_qbuf, gate_buf.data(), 0, 1);
             eval_quant_mat_vec(l.ffn_up_exps,   local_e, x_t, x_qbuf, up_buf.data(),   0, 1);
 
@@ -1378,9 +1382,7 @@ void shmem_op_local_moe(
             }
             eval_quant_mat_vec(l.ffn_down_exps, local_e, gate_buf.data(), act_qbuf, down_buf.data(), 0, 1);
 
-            // Thread-local accumulation: when nth > 1, run single-task (nth=1) at graph build time or atomic add
             for (uint32_t d = 0; d < n_embd; ++d) {
-                #pragma omp atomic
                 dst_t[d] += weight * down_buf[d];
             }
         }
@@ -1609,7 +1611,7 @@ static bool evaluate_tp_step(
             struct ggml_tensor * ffn_in        = cur;
             struct ggml_tensor * router_logits = ggml_mul_mat(ctx, l.ffn_gate_inp, ffn_in);
             struct ggml_tensor * moe_out       = ggml_map_custom2(
-                ctx, ffn_in, router_logits, shmem_op_local_moe, GGML_N_TASKS_MAX, &ep_ctx[il]
+                ctx, ffn_in, router_logits, shmem_op_local_moe, 1, &ep_ctx[il]
             );
 
             if (l.ffn_gate_shexp != nullptr) {
