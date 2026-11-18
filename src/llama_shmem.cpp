@@ -989,13 +989,12 @@ static bool evaluate_tp_step(
 ) {
     if (m.my_pe == 0) {
         for (int pe = 1; pe < m.n_pes; ++pe) {
-            shmem_putmem_nbi(sym_slot, sym_slot, offsetof(shmem_spec_packet_t, step_flag), pe);
+            shmem_putmem_nbi(sym_slot, sym_slot, offsetof(shmem_spec_packet_t, q_support_len), pe);
         }
         shmem_fence();
         for (int pe = 1; pe < m.n_pes; ++pe) {
             shmem_ulong_put_nbi(&sym_slot->step_flag, &local_step, 1, pe);
         }
-        shmem_quiet();
     } else {
         shmem_ulong_wait_until(&sym_slot->step_flag, SHMEM_CMP_EQ, local_step);
     }
@@ -1069,7 +1068,7 @@ static bool evaluate_tp_step(
         struct ggml_tensor * residual = cur;
 
         cur = ggml_rms_norm(ctx, cur, m.rms_eps);
-        cur = ggml_mul(ctx, cur, l.attn_norm);
+        cur = ggml_mul_inplace(ctx, cur, l.attn_norm);
 
         struct ggml_tensor * Qcur = ggml_mul_mat(ctx, l.wq, cur);
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx, l.wk, cur);
@@ -1119,7 +1118,7 @@ static bool evaluate_tp_step(
 
         cur = ggml_mul_mat(ctx, l.wo, cur);
         cur = ggml_map_custom1_inplace(ctx, cur, shmem_op_tp_allreduce, 1, &tp_wo_ctx);
-        cur = ggml_add(ctx, cur, residual);
+        cur = ggml_add_inplace(ctx, cur, residual);
 
         residual = cur;
         cur = ggml_rms_norm(ctx, cur, m.rms_eps);
@@ -1131,7 +1130,7 @@ static bool evaluate_tp_step(
 
         cur = ggml_mul_mat(ctx, l.ffn_down, cur);
         cur = ggml_map_custom1_inplace(ctx, cur, shmem_op_tp_allreduce, 1, &tp_ffn_ctx);
-        cur = ggml_add(ctx, cur, residual);
+        cur = ggml_add_inplace(ctx, cur, residual);
     }
 
     // During prefill (!is_decode), only the last token's logits are needed
@@ -1139,7 +1138,7 @@ static bool evaluate_tp_step(
         cur = ggml_view_2d(ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     }
     cur = ggml_rms_norm(ctx, cur, m.rms_eps);
-    cur = ggml_mul(ctx, cur, m.output_norm);
+    cur = ggml_mul_inplace(ctx, cur, m.output_norm);
     cur = ggml_mul_mat(ctx, m.output, cur);
 
     ggml_build_forward_expand(gf, cur);
@@ -1199,7 +1198,6 @@ static bool evaluate_tp_step(
         );
         shmem_fence();
         shmem_ulong_put_nbi(&sym_tp->logits_ready_seq[m.my_pe], &l_seq, 1, 0);
-        shmem_quiet();
     } else {
         for (int pe = 1; pe < m.n_pes; ++pe) {
             shmem_ulong_wait_until(&sym_tp->logits_ready_seq[pe], SHMEM_CMP_GE, l_seq);
