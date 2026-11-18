@@ -55,10 +55,14 @@ struct __attribute__((aligned(64))) shmem_spec_packet_t {
     unsigned long step_flag;
 };
 
-// Multi-Stage Butterfly (Recursive Doubling) RDMA Exchange Buffer for N_PES = 2, 4, 8, 16, 32, 64
+#define MAX_VOCAB_SHARD 65536
+
+// Multi-Stage Butterfly (Recursive Doubling) FP16 RDMA Exchange Buffer + Sharded LM Head Gather Buffer
 struct __attribute__((aligned(64))) shmem_tp_sync_t {
-    float         stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
+    ggml_fp16_t   stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
     unsigned long stage_ready_seq[2][MAX_LOG2_PES];
+    ggml_fp16_t   logits_peer_fp16[8][MAX_B_VERIFY * MAX_VOCAB_SHARD];
+    unsigned long logits_ready_seq[8];
 };
 
 static shmem_spec_packet_t * sym_slot = nullptr;
@@ -96,34 +100,40 @@ void shmem_op_tp_allreduce(struct ggml_tensor * dst, const struct ggml_tensor * 
 
     tp_allreduce_ctx_t * tp = (tp_allreduce_ctx_t *)userdata;
     const size_t total_floats = ggml_nelements(src);
-    const size_t nbytes = total_floats * sizeof(float);
+    const size_t nbytes_f32   = total_floats * sizeof(float);
+    const size_t nbytes_f16   = total_floats * sizeof(ggml_fp16_t);
     const float * src_ptr = (const float *)src->data;
     float * dst_ptr = (float *)dst->data;
 
     if (dst_ptr != src_ptr) {
-        memcpy(dst_ptr, src_ptr, nbytes);
+        memcpy(dst_ptr, src_ptr, nbytes_f32);
     }
     if (tp->n_pes <= 1) return;
 
     const int slot = tp->buf_slot;
     const unsigned long seq = ++tp_op_seq[slot];
 
+    thread_local ggml_fp16_t tx_f16[MAX_B_VERIFY * MAX_D_MODEL];
+    thread_local float       rx_f32[MAX_B_VERIFY * MAX_D_MODEL];
+
     int s = 0;
     for (int dist = 1; dist < tp->n_pes; dist <<= 1, ++s) {
         const int peer_pe = tp->my_pe ^ dist;
 
-        // Send current accumulated buffer to XOR partner for stage s
-        shmem_putmem_nbi(sym_tp->stage_peer_buf[slot][s], dst_ptr, nbytes, peer_pe);
+        // Quantize current accumulated F32 activations to FP16 for 2x faster RDMA transfer
+        ggml_fp32_to_fp16_row(dst_ptr, tx_f16, (int64_t)total_floats);
+
+        shmem_putmem_nbi(sym_tp->stage_peer_buf[slot][s], tx_f16, nbytes_f16, peer_pe);
         shmem_fence();
         shmem_ulong_put_nbi(&sym_tp->stage_ready_seq[slot][s], &seq, 1, peer_pe);
 
-        // Wait until XOR partner's stage s buffer arrives in local symmetric memory
+        // Wait until XOR partner's stage s FP16 buffer arrives in local symmetric memory
         shmem_ulong_wait_until(&sym_tp->stage_ready_seq[slot][s], SHMEM_CMP_GE, seq);
 
-        const float * __restrict p_buf = sym_tp->stage_peer_buf[slot][s];
-        float       * __restrict out   = dst_ptr;
+        ggml_fp16_to_fp32_row(sym_tp->stage_peer_buf[slot][s], rx_f32, (int64_t)total_floats);
+        float * __restrict out = dst_ptr;
         for (size_t i = 0; i < total_floats; ++i) {
-            out[i] += p_buf[i];
+            out[i] += rx_f32[i];
         }
     }
 
@@ -161,6 +171,8 @@ struct sharded_model_t {
     uint32_t n_head_local;
     uint32_t n_head_kv_local;
     uint32_t n_ff_local;
+    uint32_t vocab_offset;
+    uint32_t vocab_count;
 
     float    rms_eps;
     float    rope_freq_base;
@@ -266,12 +278,15 @@ static struct ggml_tensor * load_gguf_tensor_col_shard(
     }
 
     int64_t ne0 = meta->ne[0];
-    int64_t ne1_local = meta->ne[1] / n_pes;
+    int64_t base_rows = meta->ne[1] / n_pes;
+    int64_t row_start = (int64_t)my_pe * base_rows;
+    int64_t ne1_local = (my_pe == n_pes - 1) ? (meta->ne[1] - row_start) : base_rows;
     struct ggml_tensor * t = ggml_new_tensor_2d(dst_ctx, meta->type, ne0, ne1_local);
     ggml_set_name(t, name.c_str());
 
-    size_t nbytes = ggml_nbytes(t);
-    size_t shard_offset = base_offset + (size_t)my_pe * nbytes;
+    size_t row_bytes    = ggml_row_size(meta->type, ne0);
+    size_t nbytes       = (size_t)ne1_local * row_bytes;
+    size_t shard_offset = base_offset + (size_t)row_start * row_bytes;
     if (pread(fd, t->data, nbytes, (off_t)shard_offset) != (ssize_t)nbytes) {
         fprintf(stderr, "[PE %d] Failed reading 2D col shard %s\n", my_pe, name.c_str());
         exit(1);
@@ -410,13 +425,16 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     int fd = open(path, O_RDONLY);
     size_t bytes_loaded = 0;
 
-    m.tok_embd = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "token_embd.weight", bytes_loaded);
-    if (m.my_pe == 0) {
-        m.output_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output_norm.weight", bytes_loaded);
-        m.output      = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output.weight", bytes_loaded);
-        if (!m.output) {
-            m.output = m.tok_embd;
-        }
+    uint32_t base_v = m.n_vocab / (uint32_t)m.n_pes;
+    m.vocab_offset  = (uint32_t)m.my_pe * base_v;
+    m.vocab_count   = (m.my_pe == m.n_pes - 1) ? (m.n_vocab - m.vocab_offset) : base_v;
+
+    m.tok_embd    = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "token_embd.weight", bytes_loaded);
+    m.output_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output_norm.weight", bytes_loaded);
+    m.output      = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output.weight", m.my_pe, m.n_pes, bytes_loaded);
+    if (!m.output) {
+        size_t row_bytes = ggml_row_size(m.tok_embd->type, m.n_embd);
+        m.output = ggml_view_2d(m.weight_ctx, m.tok_embd, m.n_embd, m.vocab_count, row_bytes, (size_t)m.vocab_offset * row_bytes);
     }
 
     m.layers.resize(m.n_layer);
@@ -1025,17 +1043,67 @@ static bool evaluate_tp_step(
         cur = ggml_add(ctx, cur, residual);
     }
 
-    if (m.my_pe == 0) {
-        cur = ggml_rms_norm(ctx, cur, m.rms_eps);
-        cur = ggml_mul(ctx, cur, m.output_norm);
-        cur = ggml_mul_mat(ctx, m.output, cur);
-    }
+    // All PEs compute their 1/N_PES slice of the vocabulary LM head in parallel
+    cur = ggml_rms_norm(ctx, cur, m.rms_eps);
+    cur = ggml_mul(ctx, cur, m.output_norm);
+    cur = ggml_mul_mat(ctx, m.output, cur);
 
     ggml_build_forward_expand(gf, cur);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
-    if (m.my_pe == 0) {
-        const float * logits_all = (const float *)cur->data;
+    const uint32_t n_eval_toks = sym_slot->is_decode ? n_tokens : 1;
+    const size_t   tok_start   = sym_slot->is_decode ? 0 : (size_t)(n_tokens - 1);
+    const float *  local_logits = (const float *)cur->data + tok_start * (size_t)m.vocab_count;
+    const size_t   shard_elems  = (size_t)n_eval_toks * (size_t)m.vocab_count;
+
+    static unsigned long logits_seq = 0;
+    const unsigned long l_seq = ++logits_seq;
+
+    if (m.my_pe != 0) {
+        ggml_fp32_to_fp16_row(local_logits, sym_tp->logits_peer_fp16[m.my_pe], (int64_t)shard_elems);
+        shmem_putmem_nbi(
+            sym_tp->logits_peer_fp16[m.my_pe],
+            sym_tp->logits_peer_fp16[m.my_pe],
+            shard_elems * sizeof(ggml_fp16_t),
+            0
+        );
+        shmem_fence();
+        shmem_ulong_put_nbi(&sym_tp->logits_ready_seq[m.my_pe], &l_seq, 1, 0);
+        shmem_quiet();
+    } else {
+        static std::vector<float> full_logits_buf;
+        if (full_logits_buf.size() < (size_t)n_tokens * (size_t)m.n_vocab) {
+            full_logits_buf.resize((size_t)n_tokens * (size_t)m.n_vocab);
+        }
+
+        // Copy PE 0's own local shard directly into full_logits_buf
+        for (uint32_t t = 0; t < n_eval_toks; ++t) {
+            uint32_t dst_tok = sym_slot->is_decode ? t : (n_tokens - 1);
+            memcpy(
+                full_logits_buf.data() + (size_t)dst_tok * m.n_vocab + m.vocab_offset,
+                local_logits + (size_t)t * m.vocab_count,
+                (size_t)m.vocab_count * sizeof(float)
+            );
+        }
+
+        // Gather and unpack FP16 logit shards from PEs 1..n_pes-1
+        uint32_t base_v = m.n_vocab / (uint32_t)m.n_pes;
+        for (int pe = 1; pe < m.n_pes; ++pe) {
+            shmem_ulong_wait_until(&sym_tp->logits_ready_seq[pe], SHMEM_CMP_GE, l_seq);
+            uint32_t pe_v_off = (uint32_t)pe * base_v;
+            uint32_t pe_v_cnt = (pe == m.n_pes - 1) ? (m.n_vocab - pe_v_off) : base_v;
+            const ggml_fp16_t * peer_src = sym_tp->logits_peer_fp16[pe];
+            for (uint32_t t = 0; t < n_eval_toks; ++t) {
+                uint32_t dst_tok = sym_slot->is_decode ? t : (n_tokens - 1);
+                ggml_fp16_to_fp32_row(
+                    peer_src + (size_t)t * pe_v_cnt,
+                    full_logits_buf.data() + (size_t)dst_tok * m.n_vocab + pe_v_off,
+                    (int64_t)pe_v_cnt
+                );
+            }
+        }
+
+        const float * logits_all = full_logits_buf.data();
         const float temp         = sym_slot->temperature;
         const float min_p        = sym_slot->min_p;
         splitmix64_t tail_rng(sym_slot->rng_seed);
