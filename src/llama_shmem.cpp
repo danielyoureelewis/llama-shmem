@@ -647,25 +647,16 @@ static uint32_t propose_neural_draft(
         return u;
     };
 
-    uint32_t cur_kv_end = draft_kv_len;
+    llama_batch one_tok = llama_batch_init(1, 0, 1);
     auto decode_single_at = [&](int32_t tok, uint32_t kv_pos) -> bool {
-        if (kv_pos < cur_kv_end) {
-            llama_memory_seq_rm(mem, 0, (llama_pos)kv_pos, -1);
-        }
-        llama_batch one_tok = llama_batch_init(1, 0, 1);
+        llama_memory_seq_rm(mem, 0, (llama_pos)kv_pos, -1);
         one_tok.n_tokens     = 1;
         one_tok.token[0]     = tok;
         one_tok.pos[0]       = (llama_pos)kv_pos;
         one_tok.n_seq_id[0]  = 1;
         one_tok.seq_id[0][0] = 0;
         one_tok.logits[0]    = 1;
-        int rc = llama_decode(draft_ctx, one_tok);
-        llama_batch_free(one_tok);
-        if (rc == 0) {
-            cur_kv_end = kv_pos + 1;
-            return true;
-        }
-        return false;
+        return llama_decode(draft_ctx, one_tok) == 0;
     };
 
     // Depth 1: Sample top-1 (and top-2 if k_draft >= 2) from Root logits
@@ -683,6 +674,7 @@ static uint32_t propose_neural_draft(
     }
 
     if (n_nodes >= max_nodes) {
+        llama_batch_free(one_tok);
         return n_nodes;
     }
 
@@ -699,8 +691,8 @@ static uint32_t propose_neural_draft(
             n_d2_b = (int32_t)add_node((int8_t)n_d1_a, t2, q2, q_sup1, q_len1); // Node 4: d1_a top-2
         }
 
-        // Expand Depth 3 along primary branch A (pos = draft_kv_len + 1, no seq_rm needed!)
-        if (n_nodes < max_nodes && k_draft >= 5) {
+        // If k_draft >= 6, also expand Depth 3 along Branch A while n_d1_a is still in KV cache!
+        if (n_nodes < max_nodes && k_draft >= 6) {
             if (decode_single_at(pkt->draft_ids[n_d2_a], draft_kv_len + 1)) {
                 const float * l_d2_a = llama_get_logits_ith(draft_ctx, -1);
                 sparse_prob_t q_sup3[TOP_S_SUPPORT];
@@ -708,16 +700,34 @@ static uint32_t propose_neural_draft(
                 int32_t d3_t1 = 0, d3_t2 = 0;
                 float d3_q1 = 1.0f, d3_q2 = 1.0f;
                 sample_branch_children(l_d2_a, n_vocab, temperature, min_p, rng, q_sup3, q_len3, d3_t1, d3_q1, d3_t2, d3_q2);
-                uint32_t n_d3_a = add_node((int8_t)n_d2_a, d3_t1, d3_q1, q_sup3, q_len3); // Node 5: d2_a top-1
-                if (n_nodes < max_nodes && k_draft >= 7) {
-                    add_node((int8_t)n_d2_a, d3_t2, d3_q2, q_sup3, q_len3); // Node 6: d2_a top-2
+                uint32_t n_d3_a = add_node((int8_t)n_d2_a, d3_t1, d3_q1, q_sup3, q_len3);
+
+                // Optional Depth 4 along primary branch if space remains
+                if (n_nodes < max_nodes && k_draft >= 7 && (n_d1_b < 0)) {
+                    if (decode_single_at(pkt->draft_ids[n_d3_a], draft_kv_len + 2)) {
+                        const float * l_d3_a = llama_get_logits_ith(draft_ctx, -1);
+                        sparse_prob_t q_sup4[TOP_S_SUPPORT];
+                        uint8_t q_len4 = 0;
+                        sample_branch_children(l_d3_a, n_vocab, temperature, min_p, rng, q_sup4, q_len4, d3_t1, d3_q1, d3_t2, d3_q2);
+                        add_node((int8_t)n_d3_a, d3_t1, d3_q1, q_sup4, q_len4);
+                    }
                 }
-                (void)n_d3_a;
+            }
+            if (n_nodes < max_nodes && n_d2_b >= 0 && (n_nodes + 1 < max_nodes)) {
+                if (decode_single_at(pkt->draft_ids[n_d2_b], draft_kv_len + 1)) {
+                    const float * l_d2_b = llama_get_logits_ith(draft_ctx, -1);
+                    sparse_prob_t q_sup4[TOP_S_SUPPORT];
+                    uint8_t q_len4 = 0;
+                    int32_t d3_t1 = 0, d3_t2 = 0;
+                    float d3_q1 = 1.0f, d3_q2 = 1.0f;
+                    sample_branch_children(l_d2_b, n_vocab, temperature, min_p, rng, q_sup4, q_len4, d3_t1, d3_q1, d3_t2, d3_q2);
+                    add_node((int8_t)n_d2_b, d3_t1, d3_q1, q_sup4, q_len4);
+                }
             }
         }
     }
 
-    // Expand Branch B (from n_d1_b at kv_pos = draft_kv_len) if space remains (e.g. k_draft >= 6)
+    // Expand Branch B (from n_d1_b at kv_pos = draft_kv_len) if space remains
     if (n_nodes < max_nodes && n_d1_b >= 0) {
         if (decode_single_at(pkt->draft_ids[n_d1_b], draft_kv_len)) {
             const float * l_d1_b = llama_get_logits_ith(draft_ctx, -1);
@@ -727,8 +737,13 @@ static uint32_t propose_neural_draft(
             float b_q1 = 1.0f, b_q2 = 1.0f;
             sample_branch_children(l_d1_b, n_vocab, temperature, min_p, rng, q_sup2, q_len2, b_t1, b_q1, b_t2, b_q2);
             add_node((int8_t)n_d1_b, b_t1, b_q1, q_sup2, q_len2);
+            if (n_nodes < max_nodes) {
+                add_node((int8_t)n_d1_b, b_t2, b_q2, q_sup2, q_len2);
+            }
         }
     }
+
+    llama_batch_free(one_tok);
     return n_nodes;
 }
 
@@ -908,10 +923,9 @@ static bool evaluate_tp_step(
                     memmove(k_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
                             k_ptr + (size_t)src_slot * n_embd_k_gqa_local,
                             slot_bytes);
-                    // v_cache is stored transposed as [MAX_CTX, n_embd_k_gqa_local]: copy column src_slot -> dst_slot
-                    for (uint32_t e = 0; e < n_embd_k_gqa_local; ++e) {
-                        v_ptr[(size_t)e * MAX_CTX + dst_slot] = v_ptr[(size_t)e * MAX_CTX + src_slot];
-                    }
+                    memmove(v_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
+                            v_ptr + (size_t)src_slot * n_embd_k_gqa_local,
+                            slot_bytes);
                 }
             }
         }
@@ -970,14 +984,8 @@ static bool evaluate_tp_step(
         size_t kv_offset = (size_t)kv_commit_idx * n_embd_k_gqa_local * sizeof(float);
         size_t kv_len    = (size_t)n_tokens * n_embd_k_gqa_local;
         struct ggml_tensor * k_updated = ggml_set_1d_inplace(ctx, l.k_cache, ggml_reshape_1d(ctx, Kcur, kv_len), kv_offset);
+        struct ggml_tensor * v_updated = ggml_set_1d_inplace(ctx, l.v_cache, ggml_reshape_1d(ctx, Vcur, kv_len), kv_offset);
         ggml_build_forward_expand(gf, k_updated);
-
-        // Store Vcur [n_embd_k_gqa_local, n_tokens] directly into pre-transposed v_cache [MAX_CTX, n_embd_k_gqa_local]
-        struct ggml_tensor * v_view_dst = ggml_view_2d(ctx, l.v_cache,
-            n_tokens, n_embd_k_gqa_local,
-            MAX_CTX * sizeof(float),
-            (size_t)kv_commit_idx * sizeof(float));
-        struct ggml_tensor * v_updated = ggml_cpy(ctx, ggml_transpose(ctx, Vcur), v_view_dst);
         ggml_build_forward_expand(gf, v_updated);
 
         struct ggml_tensor * K_mem = ggml_view_3d(ctx, k_updated,
@@ -985,17 +993,17 @@ static bool evaluate_tp_step(
             n_embd_head * sizeof(float),
             n_embd_k_gqa_local * sizeof(float), 0);
 
-        // Zero-copy contiguous view of pre-transposed v_cache [n_kv, n_embd_head, n_head_kv_local]
-        struct ggml_tensor * v = ggml_view_3d(ctx, l.v_cache,
-            n_kv, n_embd_head, n_head_kv_local,
-            MAX_CTX * sizeof(float),
-            MAX_CTX * n_embd_head * sizeof(float), 0);
+        struct ggml_tensor * V_mem = ggml_view_3d(ctx, v_updated,
+            n_embd_head, n_head_kv_local, n_kv,
+            n_embd_head * sizeof(float),
+            n_embd_k_gqa_local * sizeof(float), 0);
 
         struct ggml_tensor * q  = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
         struct ggml_tensor * k  = ggml_permute(ctx, K_mem, 0, 2, 1, 3);
         struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
         kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f / sqrtf((float)n_embd_head), 0.0f);
 
+        struct ggml_tensor * v   = ggml_cont(ctx, ggml_permute(ctx, V_mem, 1, 2, 0, 3));
         struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx, kqv, n_embd_q_local, n_tokens);
@@ -1108,7 +1116,7 @@ int main(int argc, char ** argv) {
             struct llama_context_params d_cparams = llama_context_default_params();
             d_cparams.n_ctx           = MAX_CTX;
             d_cparams.n_batch         = MAX_CTX;
-            d_cparams.n_threads       = std::min(2, n_threads);
+            d_cparams.n_threads       = n_threads;
             d_cparams.n_threads_batch = n_threads;
             draft_ctx = llama_init_from_model(draft_model, d_cparams);
             vocab     = llama_model_get_vocab(draft_model);
@@ -1190,9 +1198,10 @@ int main(int argc, char ** argv) {
 
         int generated = 0;
         while (generated < n_predict) {
+            uint32_t draft_n_vocab = vocab ? std::min(model.n_vocab, (uint32_t)llama_vocab_n_tokens(vocab)) : model.n_vocab;
             uint32_t n_batch = propose_neural_draft(
                 draft_ctx, history, draft_kv_len, next_root_tok, kv_commit_idx,
-                temperature, min_p, k_draft, model.n_vocab, draft_rng, sym_slot
+                temperature, min_p, k_draft, draft_n_vocab, draft_rng, sym_slot
             );
             if (kv_commit_idx + n_batch >= MAX_CTX) {
                 n_batch = 1;
