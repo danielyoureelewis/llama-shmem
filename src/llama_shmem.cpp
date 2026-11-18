@@ -144,6 +144,15 @@ struct sharded_layer_t {
     struct ggml_tensor * wk             = nullptr;
     struct ggml_tensor * wv             = nullptr;
     struct ggml_tensor * wo             = nullptr;
+    // DeepSeek Multi-Head Latent Attention (MLA) tensors
+    struct ggml_tensor * wq_a           = nullptr; // [n_embd, q_lora_rank] (replicated)
+    struct ggml_tensor * wq_a_norm      = nullptr; // [q_lora_rank]
+    struct ggml_tensor * wq_b           = nullptr; // [q_lora_rank, n_head_local * q_head_dim] (col-sharded)
+    struct ggml_tensor * wkv_a_mqa      = nullptr; // [n_embd, kv_lora_rank + qk_rope_head_dim] (replicated)
+    struct ggml_tensor * wkv_a_norm     = nullptr; // [kv_lora_rank]
+    struct ggml_tensor * wk_b           = nullptr; // 3D [qk_nope_head_dim, kv_lora_rank, n_head_local] (head-sharded)
+    struct ggml_tensor * wv_b           = nullptr; // 3D [kv_lora_rank, v_head_dim, n_head_local] (head-sharded)
+    struct ggml_tensor * wkv_b          = nullptr; // Fallback 2D [kv_lora_rank, n_head_local * (qk_nope_dim + v_dim)]
     struct ggml_tensor * bq             = nullptr;
     struct ggml_tensor * bk             = nullptr;
     struct ggml_tensor * bv             = nullptr;
@@ -190,6 +199,14 @@ struct sharded_model_t {
     uint32_t n_ff_exp        = 0;
     float    moe_route_scale = 1.0f;
     bool     moe_norm_w      = true;
+
+    // DeepSeek MLA (Multi-Head Latent Attention) dimensions
+    bool     is_mla          = false;
+    uint32_t q_lora_rank     = 0;
+    uint32_t kv_lora_rank    = 0;
+    uint32_t qk_nope_dim     = 128;
+    uint32_t qk_rope_dim     = 64;
+    uint32_t v_head_dim      = 128;
 
     float    rms_eps;
     float    rope_freq_base;
@@ -472,6 +489,13 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     m.n_experts      = gguf_get_u32_suffix(gguf_ctx, ".expert_count", 0);
     m.n_experts_used = gguf_get_u32_suffix(gguf_ctx, ".expert_used_count", 0);
     m.n_ff_exp       = gguf_get_u32_suffix(gguf_ctx, ".expert_feed_forward_length", 0);
+    m.q_lora_rank    = gguf_get_u32_suffix(gguf_ctx, ".attention.q_lora_rank", 0);
+    m.kv_lora_rank   = gguf_get_u32_suffix(gguf_ctx, ".attention.kv_lora_rank", 0);
+    m.v_head_dim     = gguf_get_u32_suffix(gguf_ctx, ".attention.value_length", m.n_embd / m.n_head);
+    m.qk_rope_dim    = gguf_get_u32_suffix(gguf_ctx, ".rope.dimension_count", m.n_embd / m.n_head);
+    uint32_t k_len   = gguf_get_u32_suffix(gguf_ctx, ".attention.key_length", m.n_embd / m.n_head);
+    m.qk_nope_dim    = (k_len > m.qk_rope_dim) ? (k_len - m.qk_rope_dim) : (m.n_embd / m.n_head);
+    m.is_mla         = (m.kv_lora_rank > 0);
     m.rms_eps        = gguf_get_f32_suffix(gguf_ctx, ".attention.layer_norm_rms_epsilon", 1e-5f);
     m.rope_freq_base = gguf_get_f32_suffix(gguf_ctx, ".rope.freq_base", 10000.0f);
     m.rope_type      = (strcmp(arch, "qwen2") == 0) ? 2 : 0;
@@ -559,6 +583,17 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
         l.wv        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v.weight", m.kv_shard_idx, n_kv_shards, bytes_loaded);
         l.wo        = load_gguf_tensor_row_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_output.weight", m.my_pe, m.n_pes, bytes_loaded);
 
+        if (m.is_mla) {
+            l.wq_a       = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_q_a.weight", bytes_loaded);
+            l.wq_a_norm  = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_q_a_norm.weight", bytes_loaded);
+            l.wq_b       = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_q_b.weight", m.my_pe, m.n_pes, bytes_loaded);
+            l.wkv_a_mqa  = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_kv_a_mqa.weight", bytes_loaded);
+            l.wkv_a_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_kv_a_norm.weight", bytes_loaded);
+            l.wk_b       = load_gguf_tensor_expert_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_k_b.weight", m.my_pe, m.n_pes, bytes_loaded);
+            l.wv_b       = load_gguf_tensor_expert_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v_b.weight", m.my_pe, m.n_pes, bytes_loaded);
+            l.wkv_b      = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_kv_b.weight", m.my_pe, m.n_pes, bytes_loaded);
+        }
+
         l.bq        = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_q.bias", m.my_pe, m.n_pes, bytes_loaded);
         l.bk        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_k.bias", m.kv_shard_idx, n_kv_shards, bytes_loaded);
         l.bv        = load_gguf_tensor_kv_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, pfx + "attn_v.bias", m.kv_shard_idx, n_kv_shards, bytes_loaded);
@@ -583,14 +618,15 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     gguf_free(gguf_ctx);
     ggml_free(meta_ctx);
 
-    uint32_t n_embd_k_gqa_local = (m.n_embd / m.n_head) * m.n_head_kv_local;
-    size_t kv_bytes = (size_t)m.n_layer * 2 * MAX_CTX * n_embd_k_gqa_local * sizeof(float) + 16 * 1024 * 1024;
+    uint32_t n_embd_k_gqa_local = m.is_mla ? m.kv_lora_rank : ((m.n_embd / m.n_head) * m.n_head_kv_local);
+    uint32_t n_embd_v_gqa_local = m.is_mla ? m.qk_rope_dim  : n_embd_k_gqa_local;
+    size_t kv_bytes = (size_t)m.n_layer * MAX_CTX * (n_embd_k_gqa_local + n_embd_v_gqa_local) * sizeof(float) + 16 * 1024 * 1024;
     struct ggml_init_params kv_params = { kv_bytes, nullptr, false };
     m.kv_ctx = ggml_init(kv_params);
 
     for (uint32_t i = 0; i < m.n_layer; ++i) {
         m.layers[i].k_cache = ggml_new_tensor_1d(m.kv_ctx, GGML_TYPE_F32, (size_t)MAX_CTX * n_embd_k_gqa_local);
-        m.layers[i].v_cache = ggml_new_tensor_1d(m.kv_ctx, GGML_TYPE_F32, (size_t)MAX_CTX * n_embd_k_gqa_local);
+        m.layers[i].v_cache = ggml_new_tensor_1d(m.kv_ctx, GGML_TYPE_F32, (size_t)MAX_CTX * n_embd_v_gqa_local);
     }
 
     printf("[PE %d/%d] Tensor-Parallel across all %u layers (heads: %u/%u, kv_heads: %u/%u) | Weights: %.2f MB | Local KV: %.2f MB\n",
@@ -1380,8 +1416,14 @@ static bool evaluate_tp_step(
                     memmove(k_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
                             k_ptr + (size_t)src_slot * n_embd_k_gqa_local,
                             slot_bytes);
-                    for (uint32_t e = 0; e < n_embd_k_gqa_local; ++e) {
-                        v_ptr[(size_t)e * MAX_CTX + dst_slot] = v_ptr[(size_t)e * MAX_CTX + src_slot];
+                    if (m.is_mla) {
+                        memmove(v_ptr + (size_t)dst_slot * m.qk_rope_dim,
+                                v_ptr + (size_t)src_slot * m.qk_rope_dim,
+                                (size_t)m.qk_rope_dim * sizeof(float));
+                    } else {
+                        for (uint32_t e = 0; e < n_embd_k_gqa_local; ++e) {
+                            v_ptr[(size_t)e * MAX_CTX + dst_slot] = v_ptr[(size_t)e * MAX_CTX + src_slot];
+                        }
                     }
                 }
             }
@@ -1424,51 +1466,112 @@ static bool evaluate_tp_step(
         cur = ggml_rms_norm(ctx, cur, m.rms_eps);
         cur = ggml_mul_inplace(ctx, cur, l.attn_norm);
 
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx, l.wq, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx, l.wk, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx, l.wv, cur);
+        if (m.is_mla && l.wkv_a_mqa != nullptr && l.wk_b != nullptr && l.wv_b != nullptr) {
+            // DeepSeek Weight-Absorbed Multi-Head Latent Attention (MLA)
+            const uint32_t q_head_dim = m.qk_nope_dim + m.qk_rope_dim;
+            struct ggml_tensor * Q_raw = nullptr;
+            if (l.wq_a != nullptr && l.wq_b != nullptr) {
+                struct ggml_tensor * q_low = ggml_mul_mat(ctx, l.wq_a, cur);
+                q_low = ggml_rms_norm(ctx, q_low, m.rms_eps);
+                q_low = ggml_mul_inplace(ctx, q_low, l.wq_a_norm);
+                Q_raw = ggml_mul_mat(ctx, l.wq_b, q_low);
+            } else {
+                Q_raw = ggml_mul_mat(ctx, l.wq, cur);
+            }
 
-        if (l.bq) Qcur = ggml_add(ctx, Qcur, l.bq);
-        if (l.bk) Kcur = ggml_add(ctx, Kcur, l.bk);
-        if (l.bv) Vcur = ggml_add(ctx, Vcur, l.bv);
+            // Q_raw shape: [q_head_dim, n_head_local, n_tokens]
+            struct ggml_tensor * Q3d = ggml_reshape_3d(ctx, Q_raw, q_head_dim, n_head_local, n_tokens);
+            struct ggml_tensor * q_nope = ggml_view_3d(ctx, Q3d, m.qk_nope_dim, n_head_local, n_tokens, Q3d->nb[1], Q3d->nb[2], 0);
+            struct ggml_tensor * q_pe   = ggml_view_3d(ctx, Q3d, m.qk_rope_dim, n_head_local, n_tokens, Q3d->nb[1], Q3d->nb[2], (size_t)m.qk_nope_dim * sizeof(float));
+            q_pe = ggml_rope_ext(ctx, ggml_cont(ctx, q_pe), pos_t, nullptr, m.qk_rope_dim, m.rope_type, 0, m.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        Qcur = ggml_reshape_3d(ctx, Qcur, n_embd_head, n_head_local,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx, Kcur, n_embd_head, n_head_kv_local, n_tokens);
+            // Joint KV compression: [kv_lora_rank + qk_rope_dim, n_tokens]
+            struct ggml_tensor * kv_mqa = ggml_mul_mat(ctx, l.wkv_a_mqa, cur);
+            struct ggml_tensor * c_kv   = ggml_view_2d(ctx, kv_mqa, m.kv_lora_rank, n_tokens, kv_mqa->nb[1], 0);
+            c_kv = ggml_rms_norm(ctx, ggml_cont(ctx, c_kv), m.rms_eps);
+            c_kv = ggml_mul_inplace(ctx, c_kv, l.wkv_a_norm);
 
-        Qcur = ggml_rope_ext(ctx, Qcur, pos_t, nullptr, n_embd_head, m.rope_type, 0, m.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        Kcur = ggml_rope_ext(ctx, Kcur, pos_t, nullptr, n_embd_head, m.rope_type, 0, m.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            struct ggml_tensor * k_pe = ggml_view_3d(ctx, kv_mqa, m.qk_rope_dim, 1, n_tokens, kv_mqa->nb[1], kv_mqa->nb[1], (size_t)m.kv_lora_rank * sizeof(float));
+            k_pe = ggml_rope_ext(ctx, ggml_cont(ctx, k_pe), pos_t, nullptr, m.qk_rope_dim, m.rope_type, 0, m.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        size_t kv_offset = (size_t)kv_commit_idx * n_embd_k_gqa_local * sizeof(float);
-        size_t kv_len    = (size_t)n_tokens * n_embd_k_gqa_local;
-        struct ggml_tensor * k_updated = ggml_set_1d_inplace(ctx, l.k_cache, ggml_reshape_1d(ctx, Kcur, kv_len), kv_offset);
-        struct ggml_tensor * v_cur_2d  = ggml_reshape_2d(ctx, Vcur, n_embd_k_gqa_local, n_tokens);
-        struct ggml_tensor * v_updated = ggml_set_2d_inplace(
-            ctx, l.v_cache,
-            ggml_cont(ctx, ggml_transpose(ctx, v_cur_2d)),
-            MAX_CTX * sizeof(float),
-            (size_t)kv_commit_idx * sizeof(float)
-        );
-        ggml_build_forward_expand(gf, k_updated);
-        ggml_build_forward_expand(gf, v_updated);
+            // Store compressed latent c_kv in k_cache and shared k_pe in v_cache
+            struct ggml_tensor * c_kv_updated = ggml_set_1d_inplace(
+                ctx, l.k_cache, ggml_reshape_1d(ctx, c_kv, (size_t)n_tokens * m.kv_lora_rank),
+                (size_t)kv_commit_idx * m.kv_lora_rank * sizeof(float)
+            );
+            struct ggml_tensor * k_pe_updated = ggml_set_1d_inplace(
+                ctx, l.v_cache, ggml_reshape_1d(ctx, k_pe, (size_t)n_tokens * m.qk_rope_dim),
+                (size_t)kv_commit_idx * m.qk_rope_dim * sizeof(float)
+            );
+            ggml_build_forward_expand(gf, c_kv_updated);
+            ggml_build_forward_expand(gf, k_pe_updated);
 
-        struct ggml_tensor * K_mem = ggml_view_3d(ctx, k_updated,
-            n_embd_head, n_head_kv_local, n_kv,
-            n_embd_head * sizeof(float),
-            n_embd_k_gqa_local * sizeof(float), 0);
+            // Weight absorption: project q_nope through wk_b [qk_nope_dim, kv_lora_rank, n_head_local] -> q_absorb [kv_lora_rank, n_head_local, n_tokens]
+            struct ggml_tensor * q_nope_p = ggml_permute(ctx, q_nope, 0, 2, 1, 3); // [qk_nope_dim, n_tokens, n_head_local]
+            struct ggml_tensor * q_abs_p  = ggml_mul_mat(ctx, l.wk_b, q_nope_p);    // [kv_lora_rank, n_tokens, n_head_local]
 
-        struct ggml_tensor * v = ggml_view_3d(ctx, v_updated,
-            n_kv, n_embd_head, n_head_kv_local,
-            MAX_CTX * sizeof(float),
-            MAX_CTX * n_embd_head * sizeof(float), 0);
+            struct ggml_tensor * C_mem    = ggml_view_3d(ctx, c_kv_updated, m.kv_lora_rank, n_kv, 1, m.kv_lora_rank * sizeof(float), (size_t)n_kv * m.kv_lora_rank * sizeof(float), 0);
+            struct ggml_tensor * Kpe_mem  = ggml_view_3d(ctx, k_pe_updated, m.qk_rope_dim,  n_kv, 1, m.qk_rope_dim  * sizeof(float), (size_t)n_kv * m.qk_rope_dim  * sizeof(float), 0);
 
-        struct ggml_tensor * q  = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-        struct ggml_tensor * k  = ggml_permute(ctx, K_mem, 0, 2, 1, 3);
-        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
-        kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f / sqrtf((float)n_embd_head), 0.0f);
+            struct ggml_tensor * q_pe_p   = ggml_permute(ctx, q_pe, 0, 2, 1, 3);   // [qk_rope_dim, n_tokens, n_head_local]
+            struct ggml_tensor * kq_nope  = ggml_mul_mat(ctx, C_mem,   q_abs_p);   // [n_kv, n_tokens, n_head_local]
+            struct ggml_tensor * kq_rope  = ggml_mul_mat(ctx, Kpe_mem, q_pe_p);    // [n_kv, n_tokens, n_head_local]
+            struct ggml_tensor * kq       = ggml_add_inplace(ctx, kq_nope, kq_rope);
+            kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f / sqrtf((float)q_head_dim), 0.0f);
 
-        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
-        kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-        cur = ggml_cont_2d(ctx, kqv, n_embd_q_local, n_tokens);
+            // Multiply attention weights [n_kv, n_tokens, n_head_local] against compressed latent C_mem^T -> [kv_lora_rank, n_tokens, n_head_local]
+            struct ggml_tensor * C_mem_t  = ggml_cont(ctx, ggml_permute(ctx, C_mem, 1, 0, 2, 3)); // [n_kv, kv_lora_rank, 1]
+            struct ggml_tensor * lat_out  = ggml_mul_mat(ctx, C_mem_t, kq);                       // [kv_lora_rank, n_tokens, n_head_local]
+            struct ggml_tensor * v_out    = ggml_mul_mat(ctx, l.wv_b, lat_out);                   // [v_head_dim, n_tokens, n_head_local]
+            v_out = ggml_permute(ctx, v_out, 0, 2, 1, 3);                                         // [v_head_dim, n_head_local, n_tokens]
+            cur   = ggml_cont_2d(ctx, v_out, m.v_head_dim * n_head_local, n_tokens);
+        } else {
+            struct ggml_tensor * Qcur = ggml_mul_mat(ctx, l.wq, cur);
+            struct ggml_tensor * Kcur = ggml_mul_mat(ctx, l.wk, cur);
+            struct ggml_tensor * Vcur = ggml_mul_mat(ctx, l.wv, cur);
+
+            if (l.bq) Qcur = ggml_add(ctx, Qcur, l.bq);
+            if (l.bk) Kcur = ggml_add(ctx, Kcur, l.bk);
+            if (l.bv) Vcur = ggml_add(ctx, Vcur, l.bv);
+
+            Qcur = ggml_reshape_3d(ctx, Qcur, n_embd_head, n_head_local,    n_tokens);
+            Kcur = ggml_reshape_3d(ctx, Kcur, n_embd_head, n_head_kv_local, n_tokens);
+
+            Qcur = ggml_rope_ext(ctx, Qcur, pos_t, nullptr, n_embd_head, m.rope_type, 0, m.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Kcur = ggml_rope_ext(ctx, Kcur, pos_t, nullptr, n_embd_head, m.rope_type, 0, m.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            size_t kv_offset = (size_t)kv_commit_idx * n_embd_k_gqa_local * sizeof(float);
+            size_t kv_len    = (size_t)n_tokens * n_embd_k_gqa_local;
+            struct ggml_tensor * k_updated = ggml_set_1d_inplace(ctx, l.k_cache, ggml_reshape_1d(ctx, Kcur, kv_len), kv_offset);
+            struct ggml_tensor * v_cur_2d  = ggml_reshape_2d(ctx, Vcur, n_embd_k_gqa_local, n_tokens);
+            struct ggml_tensor * v_updated = ggml_set_2d_inplace(
+                ctx, l.v_cache,
+                ggml_cont(ctx, ggml_transpose(ctx, v_cur_2d)),
+                MAX_CTX * sizeof(float),
+                (size_t)kv_commit_idx * sizeof(float)
+            );
+            ggml_build_forward_expand(gf, k_updated);
+            ggml_build_forward_expand(gf, v_updated);
+
+            struct ggml_tensor * K_mem = ggml_view_3d(ctx, k_updated,
+                n_embd_head, n_head_kv_local, n_kv,
+                n_embd_head * sizeof(float),
+                n_embd_k_gqa_local * sizeof(float), 0);
+
+            struct ggml_tensor * v = ggml_view_3d(ctx, v_updated,
+                n_kv, n_embd_head, n_head_kv_local,
+                MAX_CTX * sizeof(float),
+                MAX_CTX * n_embd_head * sizeof(float), 0);
+
+            struct ggml_tensor * q  = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
+            struct ggml_tensor * k  = ggml_permute(ctx, K_mem, 0, 2, 1, 3);
+            struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+            kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f / sqrtf((float)n_embd_head), 0.0f);
+
+            struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+            kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+            cur = ggml_cont_2d(ctx, kqv, n_embd_q_local, n_tokens);
+        }
 
         cur = ggml_mul_mat(ctx, l.wo, cur);
         cur = ggml_map_custom1_inplace(ctx, cur, shmem_op_tp_allreduce, 1, &tp_wo_ctx);
