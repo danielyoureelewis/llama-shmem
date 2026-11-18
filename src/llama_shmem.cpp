@@ -1,3 +1,6 @@
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <shmem.h>
 #include <cstdio>
 #include <cstdlib>
@@ -103,9 +106,9 @@ void shmem_op_tp_allreduce(struct ggml_tensor * dst, const struct ggml_tensor * 
 
     tp_allreduce_ctx_t * tp = (tp_allreduce_ctx_t *)userdata;
     const size_t total_floats = ggml_nelements(src);
-    const size_t nbytes = total_floats * sizeof(float);
-    const float * src_ptr = (const float *)src->data;
-    float * dst_ptr = (float *)dst->data;
+    const size_t nbytes       = total_floats * sizeof(float);
+    const float * src_ptr     = (const float *)src->data;
+    float * dst_ptr           = (float *)dst->data;
 
     if (dst_ptr != src_ptr) {
         memcpy(dst_ptr, src_ptr, nbytes);
@@ -119,12 +122,10 @@ void shmem_op_tp_allreduce(struct ggml_tensor * dst, const struct ggml_tensor * 
     for (int dist = 1; dist < tp->n_pes; dist <<= 1, ++s) {
         const int peer_pe = tp->my_pe ^ dist;
 
-        // Send current accumulated buffer to XOR partner for stage s
         shmem_putmem_nbi(sym_tp->stage_peer_buf[slot][s], dst_ptr, nbytes, peer_pe);
         shmem_fence();
         shmem_ulong_put_nbi(&sym_tp->stage_ready_seq[slot][s], &seq, 1, peer_pe);
 
-        // Wait until XOR partner's stage s buffer arrives in local symmetric memory
         shmem_ulong_wait_until(&sym_tp->stage_ready_seq[slot][s], SHMEM_CMP_GE, seq);
 
         const float * __restrict p_buf = (const float *)__builtin_assume_aligned(sym_tp->stage_peer_buf[slot][s], 64);
@@ -567,14 +568,51 @@ static void sample_branch_children(
     if (temperature <= 0.0f) {
         int32_t best1 = 0, best2 = 1;
         if (logits[best2] > logits[best1]) std::swap(best1, best2);
-        for (uint32_t v = 2; v < n_vocab; ++v) {
-            if (logits[v] > logits[best1]) {
-                best2 = best1;
-                best1 = (int32_t)v;
-            } else if (logits[v] > logits[best2]) {
-                best2 = (int32_t)v;
+        int32_t t_best1[4] = { 0, 0, 0, 0 };
+        int32_t t_best2[4] = { 1, 1, 1, 1 };
+        #pragma omp parallel num_threads(4)
+        {
+            int tid = 0;
+            #ifdef _OPENMP
+            tid = omp_get_thread_num();
+            #endif
+            uint32_t chunk = (n_vocab + 3) / 4;
+            uint32_t v_start = (uint32_t)tid * chunk;
+            uint32_t v_end   = std::min(n_vocab, v_start + chunk);
+            if (v_start + 1 < v_end) {
+                int32_t b1 = (int32_t)v_start;
+                int32_t b2 = (int32_t)(v_start + 1);
+                if (logits[b2] > logits[b1]) std::swap(b1, b2);
+                for (uint32_t v = v_start + 2; v < v_end; ++v) {
+                    float val = logits[v];
+                    if (val > logits[b1]) {
+                        b2 = b1;
+                        b1 = (int32_t)v;
+                    } else if (val > logits[b2]) {
+                        b2 = (int32_t)v;
+                    }
+                }
+                t_best1[tid] = b1;
+                t_best2[tid] = b2;
             }
         }
+        int32_t cands[8] = {
+            t_best1[0], t_best2[0], t_best1[1], t_best2[1],
+            t_best1[2], t_best2[2], t_best1[3], t_best2[3]
+        };
+        best1 = cands[0];
+        best2 = -1;
+        for (int i = 1; i < 8; ++i) {
+            int32_t c = cands[i];
+            if (c == best1) continue;
+            if (logits[c] > logits[best1]) {
+                best2 = best1;
+                best1 = c;
+            } else if (best2 < 0 || logits[c] > logits[best2]) {
+                best2 = c;
+            }
+        }
+        if (best2 < 0) best2 = (best1 == 0) ? 1 : 0;
         out_len = 2;
         out_top_s[0] = { best1, 1.0f };
         out_top_s[1] = { best2, 0.0f };
@@ -1016,6 +1054,7 @@ static bool evaluate_tp_step(
     if (sym_slot->prev_n_compact > 1) {
         uint32_t base = sym_slot->prev_kv_base;
         size_t slot_bytes = (size_t)n_embd_k_gqa_local * sizeof(float);
+        #pragma omp parallel for num_threads(n_threads)
         for (size_t il = 0; il < m.layers.size(); ++il) {
             float * k_ptr = (float *)m.layers[il].k_cache->data;
             float * v_ptr = (float *)m.layers[il].v_cache->data;
@@ -1149,6 +1188,7 @@ static bool evaluate_tp_step(
     const bool     is_greedy    = (sym_slot->temperature <= 0.0f);
     const uint32_t n_cands_send = is_greedy ? 1 : TOP_S_SUPPORT;
 
+    #pragma omp parallel for num_threads(n_threads) if(n_eval_toks > 1)
     for (uint32_t t = 0; t < n_eval_toks; ++t) {
         const float * row = local_logits + (size_t)t * m.vocab_count;
         logit_cand_t * top_k = sym_tp->peer_top_logits[m.my_pe][t];
