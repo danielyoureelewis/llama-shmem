@@ -56,9 +56,16 @@ struct __attribute__((aligned(64))) shmem_spec_packet_t {
 };
 
 // Multi-Stage Butterfly (Recursive Doubling) RDMA Exchange Buffer for N_PES = 2, 4, 8, 16, 32, 64
+struct logit_cand_t {
+    int32_t token_id;
+    float   logit;
+};
+
 struct __attribute__((aligned(64))) shmem_tp_sync_t {
     float         stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
     unsigned long stage_ready_seq[2][MAX_LOG2_PES];
+    logit_cand_t  peer_top_logits[8][MAX_B_VERIFY][TOP_S_SUPPORT];
+    unsigned long logits_ready_seq[8];
 };
 
 static shmem_spec_packet_t * sym_slot = nullptr;
@@ -161,6 +168,8 @@ struct sharded_model_t {
     uint32_t n_head_local;
     uint32_t n_head_kv_local;
     uint32_t n_ff_local;
+    uint32_t vocab_offset;
+    uint32_t vocab_count;
 
     float    rms_eps;
     float    rope_freq_base;
@@ -266,12 +275,15 @@ static struct ggml_tensor * load_gguf_tensor_col_shard(
     }
 
     int64_t ne0 = meta->ne[0];
-    int64_t ne1_local = meta->ne[1] / n_pes;
+    int64_t base_rows = meta->ne[1] / n_pes;
+    int64_t row_start = (int64_t)my_pe * base_rows;
+    int64_t ne1_local = (my_pe == n_pes - 1) ? (meta->ne[1] - row_start) : base_rows;
     struct ggml_tensor * t = ggml_new_tensor_2d(dst_ctx, meta->type, ne0, ne1_local);
     ggml_set_name(t, name.c_str());
 
-    size_t nbytes = ggml_nbytes(t);
-    size_t shard_offset = base_offset + (size_t)my_pe * nbytes;
+    size_t row_bytes    = ggml_row_size(meta->type, ne0);
+    size_t nbytes       = (size_t)ne1_local * row_bytes;
+    size_t shard_offset = base_offset + (size_t)row_start * row_bytes;
     if (pread(fd, t->data, nbytes, (off_t)shard_offset) != (ssize_t)nbytes) {
         fprintf(stderr, "[PE %d] Failed reading 2D col shard %s\n", my_pe, name.c_str());
         exit(1);
@@ -410,13 +422,16 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     int fd = open(path, O_RDONLY);
     size_t bytes_loaded = 0;
 
-    m.tok_embd = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "token_embd.weight", bytes_loaded);
-    if (m.my_pe == 0) {
-        m.output_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output_norm.weight", bytes_loaded);
-        m.output      = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output.weight", bytes_loaded);
-        if (!m.output) {
-            m.output = m.tok_embd;
-        }
+    uint32_t base_v = m.n_vocab / (uint32_t)m.n_pes;
+    m.vocab_offset  = (uint32_t)m.my_pe * base_v;
+    m.vocab_count   = (m.my_pe == m.n_pes - 1) ? (m.n_vocab - m.vocab_offset) : base_v;
+
+    m.tok_embd    = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "token_embd.weight", bytes_loaded);
+    m.output_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output_norm.weight", bytes_loaded);
+    m.output      = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output.weight", m.my_pe, m.n_pes, bytes_loaded);
+    if (!m.output) {
+        size_t row_bytes = ggml_row_size(m.tok_embd->type, m.n_embd);
+        m.output = ggml_view_2d(m.weight_ctx, m.tok_embd, m.n_embd, m.vocab_count, row_bytes, (size_t)m.vocab_offset * row_bytes);
     }
 
     m.layers.resize(m.n_layer);
@@ -720,9 +735,91 @@ static uint32_t propose_neural_draft(
     return n_nodes;
 }
 
+static int32_t sample_from_top_candidates(
+    uint32_t tok_slot,
+    int n_pes,
+    float temperature,
+    float min_p,
+    splitmix64_t & rng,
+    sparse_prob_t out_top_s[TOP_S_SUPPORT],
+    uint8_t & out_len
+) {
+    if (temperature <= 0.0f) {
+        int32_t best_id  = sym_tp->peer_top_logits[0][tok_slot][0].token_id;
+        float   best_val = sym_tp->peer_top_logits[0][tok_slot][0].logit;
+        for (int pe = 1; pe < n_pes; ++pe) {
+            const logit_cand_t & c = sym_tp->peer_top_logits[pe][tok_slot][0];
+            if (c.logit > best_val) {
+                best_val = c.logit;
+                best_id  = c.token_id;
+            }
+        }
+        out_len = 1;
+        out_top_s[0] = { best_id, 1.0f };
+        return best_id;
+    }
+
+    sparse_prob_t heap[TOP_S_SUPPORT];
+    uint32_t h_sz = 0;
+    auto cmp_min = [](const sparse_prob_t & a, const sparse_prob_t & b) {
+        return a.prob > b.prob;
+    };
+    for (int pe = 0; pe < n_pes; ++pe) {
+        const logit_cand_t * cands = sym_tp->peer_top_logits[pe][tok_slot];
+        for (int k = 0; k < TOP_S_SUPPORT; ++k) {
+            if (cands[k].token_id < 0) continue;
+            float val = cands[k].logit;
+            if (h_sz < TOP_S_SUPPORT) {
+                heap[h_sz++] = { cands[k].token_id, val };
+                if (h_sz == TOP_S_SUPPORT) std::make_heap(heap, heap + TOP_S_SUPPORT, cmp_min);
+            } else if (val > heap[0].prob) {
+                std::pop_heap(heap, heap + TOP_S_SUPPORT, cmp_min);
+                heap[TOP_S_SUPPORT - 1] = { cands[k].token_id, val };
+                std::push_heap(heap, heap + TOP_S_SUPPORT, cmp_min);
+            }
+        }
+    }
+    std::sort(heap, heap + h_sz, cmp_min);
+
+    float max_l    = heap[0].prob;
+    float inv_temp = 1.0f / temperature;
+    float sum_exp  = 0.0f;
+    for (uint32_t i = 0; i < h_sz; ++i) {
+        heap[i].prob = expf((heap[i].prob - max_l) * inv_temp);
+        sum_exp += heap[i].prob;
+    }
+    for (uint32_t i = 0; i < h_sz; ++i) {
+        heap[i].prob /= sum_exp;
+    }
+
+    float p_max  = heap[0].prob;
+    float thresh = min_p * p_max;
+    uint8_t p_len = 0;
+    float renorm = 0.0f;
+    for (uint32_t i = 0; i < h_sz; ++i) {
+        if (i == 0 || heap[i].prob >= thresh) {
+            out_top_s[p_len++] = heap[i];
+            renorm += heap[i].prob;
+        }
+    }
+    for (uint8_t i = 0; i < p_len; ++i) {
+        out_top_s[i].prob /= renorm;
+    }
+    out_len = p_len;
+
+    float r = rng.next_f32();
+    float cdf = 0.0f;
+    for (uint8_t i = 0; i < p_len; ++i) {
+        cdf += out_top_s[i].prob;
+        if (r <= cdf || i + 1 == p_len) {
+            return out_top_s[i].token_id;
+        }
+    }
+    return out_top_s[0].token_id;
+}
+
 static void verify_tree_local(
-    const float * logits_all,
-    uint32_t n_vocab,
+    int n_pes,
     uint32_t n_tokens,
     float temp,
     float min_p,
@@ -737,10 +834,9 @@ static void verify_tree_local(
     accepted_slots[0] = 0;
 
     while (true) {
-        const float * row = logits_all + (size_t)cur_node * n_vocab;
         sparse_prob_t p_sup[TOP_S_SUPPORT];
         uint8_t p_len = 0;
-        int32_t greedy_or_init = sample_from_logits(row, n_vocab, temp, min_p, rng, p_sup, p_len);
+        int32_t greedy_or_init = sample_from_top_candidates(cur_node, n_pes, temp, min_p, rng, p_sup, p_len);
 
         uint32_t children[MAX_B_VERIFY];
         uint32_t n_children = 0;
@@ -998,31 +1094,90 @@ static bool evaluate_tp_step(
         cur = ggml_add(ctx, cur, residual);
     }
 
-    if (m.my_pe == 0) {
-        cur = ggml_rms_norm(ctx, cur, m.rms_eps);
-        cur = ggml_mul(ctx, cur, m.output_norm);
-        cur = ggml_mul_mat(ctx, m.output, cur);
+    // During prefill (!is_decode), only the last token's logits are needed
+    if (!sym_slot->is_decode && n_tokens > 1) {
+        cur = ggml_view_2d(ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     }
+    cur = ggml_rms_norm(ctx, cur, m.rms_eps);
+    cur = ggml_mul(ctx, cur, m.output_norm);
+    cur = ggml_mul_mat(ctx, m.output, cur);
 
     ggml_build_forward_expand(gf, cur);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
-    if (m.my_pe == 0) {
-        const float * logits_all = (const float *)cur->data;
-        const float temp         = sym_slot->temperature;
-        const float min_p        = sym_slot->min_p;
+    const uint32_t n_eval_toks  = sym_slot->is_decode ? n_tokens : 1;
+    const float *  local_logits = (const float *)cur->data;
+    const bool     is_greedy    = (sym_slot->temperature <= 0.0f);
+    const uint32_t n_cands_send = is_greedy ? 1 : TOP_S_SUPPORT;
+
+    for (uint32_t t = 0; t < n_eval_toks; ++t) {
+        const float * row = local_logits + (size_t)t * m.vocab_count;
+        logit_cand_t * top_k = sym_tp->peer_top_logits[m.my_pe][t];
+        if (is_greedy) {
+            float best_val = row[0];
+            uint32_t best_v = 0;
+            for (uint32_t v = 1; v < m.vocab_count; ++v) {
+                if (row[v] > best_val) {
+                    best_val = row[v];
+                    best_v   = v;
+                }
+            }
+            top_k[0] = { (int32_t)(m.vocab_offset + best_v), best_val };
+        } else {
+            for (int k = 0; k < TOP_S_SUPPORT; ++k) top_k[k] = { -1, -INFINITY };
+            float min_top = -INFINITY;
+            int   min_idx = 0;
+            for (uint32_t v = 0; v < m.vocab_count; ++v) {
+                float val = row[v];
+                if (val > min_top) {
+                    top_k[min_idx] = { (int32_t)(m.vocab_offset + v), val };
+                    min_top = top_k[0].logit;
+                    min_idx = 0;
+                    for (int k = 1; k < TOP_S_SUPPORT; ++k) {
+                        if (top_k[k].logit < min_top) {
+                            min_top = top_k[k].logit;
+                            min_idx = k;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static unsigned long logits_seq = 0;
+    const unsigned long l_seq = ++logits_seq;
+
+    if (m.my_pe != 0) {
+        size_t total_put_bytes = is_greedy
+            ? ((size_t)(n_eval_toks - 1) * TOP_S_SUPPORT + 1) * sizeof(logit_cand_t)
+            : (size_t)n_eval_toks * TOP_S_SUPPORT * sizeof(logit_cand_t);
+        shmem_putmem_nbi(
+            sym_tp->peer_top_logits[m.my_pe][0],
+            sym_tp->peer_top_logits[m.my_pe][0],
+            total_put_bytes,
+            0
+        );
+        shmem_fence();
+        shmem_ulong_put_nbi(&sym_tp->logits_ready_seq[m.my_pe], &l_seq, 1, 0);
+        shmem_quiet();
+    } else {
+        for (int pe = 1; pe < m.n_pes; ++pe) {
+            shmem_ulong_wait_until(&sym_tp->logits_ready_seq[pe], SHMEM_CMP_GE, l_seq);
+        }
+
+        const float temp  = sym_slot->temperature;
+        const float min_p = sym_slot->min_p;
         splitmix64_t tail_rng(sym_slot->rng_seed);
 
         if (!sym_slot->is_decode) {
-            const float * last_logits = logits_all + (size_t)(n_tokens - 1) * m.n_vocab;
             sparse_prob_t dummy_sup[TOP_S_SUPPORT];
             uint8_t dummy_len = 0;
             out_n_accepted    = 0;
             out_n_committed   = 1;
             accepted_slots[0] = 0;
-            committed_ids[0]  = sample_from_logits(last_logits, m.n_vocab, temp, min_p, tail_rng, dummy_sup, dummy_len);
+            committed_ids[0]  = sample_from_top_candidates(0, m.n_pes, temp, min_p, tail_rng, dummy_sup, dummy_len);
         } else {
-            verify_tree_local(logits_all, m.n_vocab, n_tokens, temp, min_p, tail_rng,
+            verify_tree_local(m.n_pes, n_tokens, temp, min_p, tail_rng,
                               out_n_accepted, out_n_committed, committed_ids, accepted_slots);
         }
     }
