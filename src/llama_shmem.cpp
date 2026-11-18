@@ -188,6 +188,8 @@ struct sharded_model_t {
     uint32_t n_experts_local = 0;
     uint32_t expert_offset   = 0;
     uint32_t n_ff_exp        = 0;
+    float    moe_route_scale = 1.0f;
+    bool     moe_norm_w      = true;
 
     float    rms_eps;
     float    rope_freq_base;
@@ -508,6 +510,7 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     if (m.n_experts > 0) {
         m.n_experts_local = m.n_experts / (uint32_t)m.n_pes;
         m.expert_offset   = (uint32_t)m.my_pe * m.n_experts_local;
+        m.moe_route_scale = gguf_get_f32_suffix(gguf_ctx, ".expert_weights_scale", 1.0f);
     }
 
     struct ggml_tensor * embd_meta = ggml_get_tensor(meta_ctx, "token_embd.weight");
@@ -1137,6 +1140,197 @@ static void verify_tree_local(
     out_n_committed = n_acc + 1;
 }
 
+struct ep_moe_ctx_t {
+    const sharded_model_t * model;
+    const sharded_layer_t * layer;
+};
+
+// Helper: compute dot product between a quantized weight row (in 3D expert tensor) and a quantized Q8_K/Q8_0 or F32 vector
+static inline void eval_quant_mat_vec(
+    const struct ggml_tensor * weight_3d,
+    uint32_t local_exp_idx,
+    const float * __restrict x_f32,
+    std::vector<uint8_t> & x_qbuf,
+    float * __restrict out_f32,
+    int ith,
+    int nth
+) {
+    const int64_t ne0 = weight_3d->ne[0];
+    const int64_t ne1 = weight_3d->ne[1];
+    const int64_t r_start = (ne1 * ith) / nth;
+    const int64_t r_end   = (ne1 * (ith + 1)) / nth;
+    if (r_start >= r_end) return;
+
+    const uint8_t * exp_base = (const uint8_t *)weight_3d->data + (size_t)local_exp_idx * weight_3d->nb[2];
+    const size_t    row_nb   = weight_3d->nb[1];
+
+    if (weight_3d->type == GGML_TYPE_F32) {
+        for (int64_t r = r_start; r < r_end; ++r) {
+            const float * w_row = (const float *)(exp_base + (size_t)r * row_nb);
+            float sum = 0.0f;
+            #pragma omp simd reduction(+:sum)
+            for (int64_t c = 0; c < ne0; ++c) {
+                sum += w_row[c] * x_f32[c];
+            }
+            out_f32[r] = sum;
+        }
+        return;
+    }
+
+    const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(weight_3d->type);
+    for (int64_t r = r_start; r < r_end; ++r) {
+        const void * w_row = exp_base + (size_t)r * row_nb;
+        float sum = 0.0f;
+        traits->vec_dot((int)ne0, &sum, 0, w_row, 0, x_qbuf.data(), 0, 1);
+        out_f32[r] = sum;
+    }
+}
+
+// Expert-Parallel (EP) MoE Operator:
+// Evaluates only the Top-K routed experts owned by my_pe ([expert_offset .. expert_offset + n_experts_local - 1])
+// in native Q4_K / Q6_K / Q8_0 quantization without any cross-PE expert weight splitting.
+void shmem_op_local_moe(
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * ffn_in,
+    const struct ggml_tensor * router_logits,
+    int ith,
+    int nth,
+    void * userdata
+) {
+    ep_moe_ctx_t * ep = (ep_moe_ctx_t *)userdata;
+    const sharded_model_t & m = *ep->model;
+    const sharded_layer_t & l = *ep->layer;
+
+    const uint32_t n_embd          = m.n_embd;
+    const uint32_t n_tokens        = (uint32_t)ffn_in->ne[1];
+    const uint32_t n_experts       = m.n_experts;
+    const uint32_t n_used          = m.n_experts_used;
+    const uint32_t exp_start       = m.expert_offset;
+    const uint32_t exp_end         = exp_start + m.n_experts_local;
+    const uint32_t n_ff_exp        = (uint32_t)l.ffn_gate_exps->ne[1];
+    const bool     has_bias        = (l.exp_probs_b != nullptr);
+    const float *  bias_ptr        = has_bias ? (const float *)l.exp_probs_b->data : nullptr;
+
+    float * dst_data = (float *)dst->data;
+    const size_t total_dst_floats = (size_t)n_embd * n_tokens;
+    const size_t zero_start = (total_dst_floats * (size_t)ith) / (size_t)nth;
+    const size_t zero_end   = (total_dst_floats * (size_t)(ith + 1)) / (size_t)nth;
+    for (size_t i = zero_start; i < zero_end; ++i) {
+        dst_data[i] = 0.0f;
+    }
+
+    const struct ggml_type_traits_cpu * gate_traits = ggml_get_type_traits_cpu(l.ffn_gate_exps->type);
+    const struct ggml_type_traits_cpu * down_traits = ggml_get_type_traits_cpu(l.ffn_down_exps->type);
+
+    std::vector<uint8_t> x_qbuf(ggml_row_size(gate_traits->vec_dot_type, n_embd) + 64);
+    std::vector<uint8_t> act_qbuf(ggml_row_size(down_traits->vec_dot_type, n_ff_exp) + 64);
+    std::vector<float>   gate_buf(n_ff_exp);
+    std::vector<float>   up_buf(n_ff_exp);
+    std::vector<float>   down_buf(n_embd);
+
+    std::vector<float>    scores(n_experts);
+    std::vector<float>    raw_probs(n_experts);
+    std::vector<uint32_t> top_idx(n_used);
+    std::vector<float>    top_w(n_used);
+
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const float * logits_t = (const float *)router_logits->data + (size_t)t * n_experts;
+
+        if (has_bias) {
+            // DeepSeek-V3 / R1 / V4 Sigmoid Routing + Auxiliary-Loss-Free Bias
+            for (uint32_t e = 0; e < n_experts; ++e) {
+                float p = 1.0f / (1.0f + expf(-logits_t[e]));
+                raw_probs[e] = p;
+                scores[e]    = p + bias_ptr[e];
+            }
+        } else {
+            // Standard Softmax MoE Routing (DeepSeek-V2 / Qwen-MoE)
+            float max_l = logits_t[0];
+            for (uint32_t e = 1; e < n_experts; ++e) {
+                if (logits_t[e] > max_l) max_l = logits_t[e];
+            }
+            float sum_exp = 0.0f;
+            for (uint32_t e = 0; e < n_experts; ++e) {
+                raw_probs[e] = expf(logits_t[e] - max_l);
+                sum_exp += raw_probs[e];
+            }
+            float inv_sum = 1.0f / sum_exp;
+            for (uint32_t e = 0; e < n_experts; ++e) {
+                raw_probs[e] *= inv_sum;
+                scores[e] = raw_probs[e];
+            }
+        }
+
+        // Select Top-K experts
+        float w_sum = 0.0f;
+        for (uint32_t k = 0; k < n_used; ++k) {
+            uint32_t best_e = 0;
+            float    best_s = -INFINITY;
+            for (uint32_t e = 0; e < n_experts; ++e) {
+                if (scores[e] > best_s) {
+                    best_s = scores[e];
+                    best_e = e;
+                }
+            }
+            top_idx[k]    = best_e;
+            top_w[k]      = raw_probs[best_e];
+            w_sum        += top_w[k];
+            scores[best_e] = -INFINITY;
+        }
+
+        float norm_scale = (m.moe_norm_w && w_sum > 0.0f) ? (m.moe_route_scale / w_sum) : m.moe_route_scale;
+
+        // Check if any selected expert belongs to my_pe before quantizing x_t
+        bool any_local = false;
+        for (uint32_t k = 0; k < n_used; ++k) {
+            if (top_idx[k] >= exp_start && top_idx[k] < exp_end) {
+                any_local = true;
+                break;
+            }
+        }
+        if (!any_local) continue;
+
+        const float * x_t = (const float *)ffn_in->data + (size_t)t * n_embd;
+        if (l.ffn_gate_exps->type != GGML_TYPE_F32 && gate_traits->from_float) {
+            gate_traits->from_float(x_t, x_qbuf.data(), n_embd);
+        }
+
+        float * dst_t = dst_data + (size_t)t * n_embd;
+
+        for (uint32_t k = 0; k < n_used; ++k) {
+            uint32_t e = top_idx[k];
+            if (e < exp_start || e >= exp_end) continue;
+
+            uint32_t local_e = e - exp_start;
+            float    weight  = top_w[k] * norm_scale;
+
+            // Each thread computes the entire expert for its assigned subset of tokens or rows;
+            // to avoid internal thread barriers inside custom2, partition experts across threads (k % nth == ith)!
+            if ((int)(k % (uint32_t)nth) != ith) continue;
+
+            eval_quant_mat_vec(l.ffn_gate_exps, local_e, x_t, x_qbuf, gate_buf.data(), 0, 1);
+            eval_quant_mat_vec(l.ffn_up_exps,   local_e, x_t, x_qbuf, up_buf.data(),   0, 1);
+
+            for (uint32_t j = 0; j < n_ff_exp; ++j) {
+                float g = gate_buf[j];
+                float silu_g = g / (1.0f + expf(-g));
+                gate_buf[j] = silu_g * up_buf[j];
+            }
+
+            if (l.ffn_down_exps->type != GGML_TYPE_F32 && down_traits->from_float) {
+                down_traits->from_float(gate_buf.data(), act_qbuf.data(), n_ff_exp);
+            }
+            eval_quant_mat_vec(l.ffn_down_exps, local_e, gate_buf.data(), act_qbuf, down_buf.data(), 0, 1);
+
+            // Thread-local accumulation: when nth > 1, run single-task (nth=1) at graph build time or atomic add
+            for (uint32_t d = 0; d < n_embd; ++d) {
+                #pragma omp atomic
+                dst_t[d] += weight * down_buf[d];
+            }
+        }
+    }
+}
+
 static bool evaluate_tp_step(
     sharded_model_t & m,
     int n_threads,
@@ -1282,15 +1476,40 @@ static bool evaluate_tp_step(
 
         residual = cur;
         cur = ggml_rms_norm(ctx, cur, m.rms_eps);
-        cur = ggml_mul(ctx, cur, l.ffn_norm);
+        cur = ggml_mul_inplace(ctx, cur, l.ffn_norm);
 
-        struct ggml_tensor * gate = ggml_silu(ctx, ggml_mul_mat(ctx, l.ffn_gate, cur));
-        struct ggml_tensor * up   = ggml_mul_mat(ctx, l.ffn_up, cur);
-        cur = ggml_mul(ctx, gate, up);
+        if (l.ffn_gate_exps != nullptr && l.ffn_gate_inp != nullptr) {
+            // DeepSeek / MoE Expert-Parallel (EP) + Shared-Expert Tensor-Parallel FFN
+            static ep_moe_ctx_t ep_ctx[128];
+            ep_ctx[il] = { &m, &l };
 
-        cur = ggml_mul_mat(ctx, l.ffn_down, cur);
-        cur = ggml_map_custom1_inplace(ctx, cur, shmem_op_tp_allreduce, 1, &tp_ffn_ctx);
-        cur = ggml_add_inplace(ctx, cur, residual);
+            struct ggml_tensor * ffn_in        = cur;
+            struct ggml_tensor * router_logits = ggml_mul_mat(ctx, l.ffn_gate_inp, ffn_in);
+            struct ggml_tensor * moe_out       = ggml_map_custom2(
+                ctx, ffn_in, router_logits, shmem_op_local_moe, GGML_N_TASKS_MAX, &ep_ctx[il]
+            );
+
+            if (l.ffn_gate_shexp != nullptr) {
+                struct ggml_tensor * sh_gate = ggml_silu_inplace(ctx, ggml_mul_mat(ctx, l.ffn_gate_shexp, ffn_in));
+                struct ggml_tensor * sh_up   = ggml_mul_mat(ctx, l.ffn_up_shexp, ffn_in);
+                struct ggml_tensor * sh_act  = ggml_mul_inplace(ctx, sh_gate, sh_up);
+                struct ggml_tensor * sh_down = ggml_mul_mat(ctx, l.ffn_down_shexp, sh_act);
+                moe_out = ggml_add_inplace(ctx, moe_out, sh_down);
+            }
+
+            // Single Butterfly AllReduce sums both TP Shared Expert and EP Routed Experts across all PEs!
+            cur = ggml_map_custom1_inplace(ctx, moe_out, shmem_op_tp_allreduce, 1, &tp_ffn_ctx);
+            cur = ggml_add_inplace(ctx, cur, residual);
+        } else {
+            // Dense Tensor-Parallel SwiGLU FFN (also used by DeepSeek layers 0..2)
+            struct ggml_tensor * gate = ggml_silu_inplace(ctx, ggml_mul_mat(ctx, l.ffn_gate, cur));
+            struct ggml_tensor * up   = ggml_mul_mat(ctx, l.ffn_up, cur);
+            cur = ggml_mul_inplace(ctx, gate, up);
+
+            cur = ggml_mul_mat(ctx, l.ffn_down, cur);
+            cur = ggml_map_custom1_inplace(ctx, cur, shmem_op_tp_allreduce, 1, &tp_ffn_ctx);
+            cur = ggml_add_inplace(ctx, cur, residual);
+        }
     }
 
     // During prefill (!is_decode), only the last token's logits are needed
