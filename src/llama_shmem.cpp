@@ -992,9 +992,9 @@ static bool evaluate_tp_step(
                     memmove(k_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
                             k_ptr + (size_t)src_slot * n_embd_k_gqa_local,
                             slot_bytes);
-                    memmove(v_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
-                            v_ptr + (size_t)src_slot * n_embd_k_gqa_local,
-                            slot_bytes);
+                    for (uint32_t e = 0; e < n_embd_k_gqa_local; ++e) {
+                        v_ptr[(size_t)e * MAX_CTX + dst_slot] = v_ptr[(size_t)e * MAX_CTX + src_slot];
+                    }
                 }
             }
         }
@@ -1053,7 +1053,13 @@ static bool evaluate_tp_step(
         size_t kv_offset = (size_t)kv_commit_idx * n_embd_k_gqa_local * sizeof(float);
         size_t kv_len    = (size_t)n_tokens * n_embd_k_gqa_local;
         struct ggml_tensor * k_updated = ggml_set_1d_inplace(ctx, l.k_cache, ggml_reshape_1d(ctx, Kcur, kv_len), kv_offset);
-        struct ggml_tensor * v_updated = ggml_set_1d_inplace(ctx, l.v_cache, ggml_reshape_1d(ctx, Vcur, kv_len), kv_offset);
+        struct ggml_tensor * v_cur_2d  = ggml_reshape_2d(ctx, Vcur, n_embd_k_gqa_local, n_tokens);
+        struct ggml_tensor * v_updated = ggml_set_2d_inplace(
+            ctx, l.v_cache,
+            ggml_cont(ctx, ggml_transpose(ctx, v_cur_2d)),
+            MAX_CTX * sizeof(float),
+            (size_t)kv_commit_idx * sizeof(float)
+        );
         ggml_build_forward_expand(gf, k_updated);
         ggml_build_forward_expand(gf, v_updated);
 
@@ -1062,17 +1068,16 @@ static bool evaluate_tp_step(
             n_embd_head * sizeof(float),
             n_embd_k_gqa_local * sizeof(float), 0);
 
-        struct ggml_tensor * V_mem = ggml_view_3d(ctx, v_updated,
-            n_embd_head, n_head_kv_local, n_kv,
-            n_embd_head * sizeof(float),
-            n_embd_k_gqa_local * sizeof(float), 0);
+        struct ggml_tensor * v = ggml_view_3d(ctx, v_updated,
+            n_kv, n_embd_head, n_head_kv_local,
+            MAX_CTX * sizeof(float),
+            MAX_CTX * n_embd_head * sizeof(float), 0);
 
         struct ggml_tensor * q  = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
         struct ggml_tensor * k  = ggml_permute(ctx, K_mem, 0, 2, 1, 3);
         struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
         kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f / sqrtf((float)n_embd_head), 0.0f);
 
-        struct ggml_tensor * v   = ggml_cont(ctx, ggml_permute(ctx, V_mem, 1, 2, 0, 3));
         struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx, kqv, n_embd_q_local, n_tokens);
