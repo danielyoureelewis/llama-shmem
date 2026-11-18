@@ -540,15 +540,35 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     struct ggml_tensor * embd_meta = ggml_get_tensor(meta_ctx, "token_embd.weight");
     m.n_vocab = embd_meta->ne[1];
 
-    // Reserve extra headroom in case Q4_K row-shards are repacked to Q8_0
-    size_t shard_bytes = 256 * 1024 * 1024;
+    // Compute exact per-PE weight arena size (only adding Q8_0 repack bytes when ne[0]/n_pes breaks super-block alignment)
+    size_t shard_bytes = 64 * 1024 * 1024;
     int n_tensors = gguf_get_n_tensors(gguf_ctx);
     for (int i = 0; i < n_tensors; ++i) {
         const char * tname = gguf_get_tensor_name(gguf_ctx, i);
         struct ggml_tensor * tm = ggml_get_tensor(meta_ctx, tname);
         int blk_id = -1;
-        if (sscanf(tname, "blk.%d.", &blk_id) == 1) {
-            shard_bytes += ((ggml_nbytes(tm) * 2) / m.n_pes) + 4096;
+        if (strcmp(tname, "output.weight") == 0) {
+            shard_bytes += (ggml_nbytes(tm) / m.n_pes) + 65536;
+        } else if (sscanf(tname, "blk.%d.", &blk_id) == 1) {
+            bool is_row_shard = (strstr(tname, "attn_output.weight") != nullptr ||
+                                 strstr(tname, "ffn_down.weight") != nullptr ||
+                                 strstr(tname, "ffn_down_shexp.weight") != nullptr);
+            bool is_replicated = (strstr(tname, "norm.weight") != nullptr ||
+                                  strstr(tname, "ffn_gate_inp.weight") != nullptr ||
+                                  strstr(tname, "exp_probs_b.bias") != nullptr ||
+                                  strstr(tname, "attn_q_a.weight") != nullptr ||
+                                  strstr(tname, "attn_kv_a_mqa.weight") != nullptr);
+            bool is_kv = (strstr(tname, "attn_k.") != nullptr || strstr(tname, "attn_v.") != nullptr);
+            if (is_replicated) {
+                shard_bytes += ggml_nbytes(tm) + 4096;
+            } else if (is_kv) {
+                shard_bytes += (ggml_nbytes(tm) / n_kv_shards) + 4096;
+            } else if (is_row_shard && ((tm->ne[0] / m.n_pes) % ggml_blck_size(tm->type) != 0)) {
+                size_t q8_bytes = ggml_row_size(GGML_TYPE_Q8_0, tm->ne[0] / m.n_pes) * (size_t)tm->ne[1];
+                shard_bytes += q8_bytes + 4096;
+            } else {
+                shard_bytes += (ggml_nbytes(tm) / m.n_pes) + 4096;
+            }
         } else {
             shard_bytes += ggml_nbytes(tm) + 4096;
         }
