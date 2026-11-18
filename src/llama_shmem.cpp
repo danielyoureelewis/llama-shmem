@@ -19,7 +19,7 @@
 #include "gguf.h"
 #include "llama.h"
 
-#define MAX_K_DRAFT   7
+#define MAX_K_DRAFT 7
 #define MAX_B_VERIFY  (MAX_K_DRAFT + 1)
 #define TOP_S_SUPPORT 32
 #define MAX_D_MODEL   8192
@@ -55,13 +55,17 @@ struct __attribute__((aligned(64))) shmem_spec_packet_t {
     unsigned long step_flag;
 };
 
-#define MAX_VOCAB_SHARD 65536
+// Compact Top-S (32) candidate pair for distributed sharded LM head gather (256 bytes/token)
+struct logit_cand_t {
+    int32_t token_id;
+    float   logit;
+};
 
-// Multi-Stage Butterfly (Recursive Doubling) FP16 RDMA Exchange Buffer + Sharded LM Head Gather Buffer
+// Multi-Stage Butterfly (Recursive Doubling) FP16 RDMA Exchange Buffer + Compact Top-S LM Head Gather
 struct __attribute__((aligned(64))) shmem_tp_sync_t {
     ggml_fp16_t   stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
     unsigned long stage_ready_seq[2][MAX_LOG2_PES];
-    ggml_fp16_t   logits_peer_fp16[8][MAX_B_VERIFY * MAX_VOCAB_SHARD];
+    logit_cand_t  peer_top_logits[8][MAX_B_VERIFY][TOP_S_SUPPORT];
     unsigned long logits_ready_seq[8];
 };
 
@@ -1051,20 +1055,44 @@ static bool evaluate_tp_step(
     ggml_build_forward_expand(gf, cur);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
-    const uint32_t n_eval_toks = sym_slot->is_decode ? n_tokens : 1;
-    const size_t   tok_start   = sym_slot->is_decode ? 0 : (size_t)(n_tokens - 1);
+    const uint32_t n_eval_toks  = sym_slot->is_decode ? n_tokens : 1;
+    const size_t   tok_start    = sym_slot->is_decode ? 0 : (size_t)(n_tokens - 1);
     const float *  local_logits = (const float *)cur->data + tok_start * (size_t)m.vocab_count;
-    const size_t   shard_elems  = (size_t)n_eval_toks * (size_t)m.vocab_count;
+
+    // Every PE extracts its local Top-S (32) candidates per token in parallel (O(V/P) scan, 256 bytes/tok)
+    for (uint32_t t = 0; t < n_eval_toks; ++t) {
+        const float * row = local_logits + (size_t)t * m.vocab_count;
+        logit_cand_t * top_k = sym_tp->peer_top_logits[m.my_pe][t];
+        for (int k = 0; k < TOP_S_SUPPORT; ++k) {
+            top_k[k] = { -1, -INFINITY };
+        }
+        float min_top = -INFINITY;
+        int   min_idx = 0;
+        for (uint32_t v = 0; v < m.vocab_count; ++v) {
+            float val = row[v];
+            if (val > min_top) {
+                top_k[min_idx] = { (int32_t)(m.vocab_offset + v), val };
+                min_top = top_k[0].logit;
+                min_idx = 0;
+                for (int k = 1; k < TOP_S_SUPPORT; ++k) {
+                    if (top_k[k].logit < min_top) {
+                        min_top = top_k[k].logit;
+                        min_idx = k;
+                    }
+                }
+            }
+        }
+    }
 
     static unsigned long logits_seq = 0;
     const unsigned long l_seq = ++logits_seq;
 
     if (m.my_pe != 0) {
-        ggml_fp32_to_fp16_row(local_logits, sym_tp->logits_peer_fp16[m.my_pe], (int64_t)shard_elems);
+        // Send only 256 bytes per token (n_eval_toks * 32 * 8 bytes = <= 2 KB total!) to PE 0
         shmem_putmem_nbi(
-            sym_tp->logits_peer_fp16[m.my_pe],
-            sym_tp->logits_peer_fp16[m.my_pe],
-            shard_elems * sizeof(ggml_fp16_t),
+            sym_tp->peer_top_logits[m.my_pe],
+            sym_tp->peer_top_logits[m.my_pe],
+            (size_t)n_eval_toks * TOP_S_SUPPORT * sizeof(logit_cand_t),
             0
         );
         shmem_fence();
@@ -1072,34 +1100,32 @@ static bool evaluate_tp_step(
         shmem_quiet();
     } else {
         static std::vector<float> full_logits_buf;
-        if (full_logits_buf.size() < (size_t)n_tokens * (size_t)m.n_vocab) {
-            full_logits_buf.resize((size_t)n_tokens * (size_t)m.n_vocab);
+        static std::vector<int32_t> touched_ids;
+        if (full_logits_buf.size() < (size_t)MAX_B_VERIFY * (size_t)m.n_vocab) {
+            full_logits_buf.assign((size_t)MAX_B_VERIFY * (size_t)m.n_vocab, -INFINITY);
+        } else {
+            for (int32_t idx : touched_ids) {
+                full_logits_buf[idx] = -INFINITY;
+            }
+            touched_ids.clear();
         }
 
-        // Copy PE 0's own local shard directly into full_logits_buf
-        for (uint32_t t = 0; t < n_eval_toks; ++t) {
-            uint32_t dst_tok = sym_slot->is_decode ? t : (n_tokens - 1);
-            memcpy(
-                full_logits_buf.data() + (size_t)dst_tok * m.n_vocab + m.vocab_offset,
-                local_logits + (size_t)t * m.vocab_count,
-                (size_t)m.vocab_count * sizeof(float)
-            );
-        }
-
-        // Gather and unpack FP16 logit shards from PEs 1..n_pes-1
-        uint32_t base_v = m.n_vocab / (uint32_t)m.n_pes;
         for (int pe = 1; pe < m.n_pes; ++pe) {
             shmem_ulong_wait_until(&sym_tp->logits_ready_seq[pe], SHMEM_CMP_GE, l_seq);
-            uint32_t pe_v_off = (uint32_t)pe * base_v;
-            uint32_t pe_v_cnt = (pe == m.n_pes - 1) ? (m.n_vocab - pe_v_off) : base_v;
-            const ggml_fp16_t * peer_src = sym_tp->logits_peer_fp16[pe];
+        }
+
+        // Scatter the 4 * 32 = 128 global top candidates per token into full_logits_buf in O(1)
+        for (int pe = 0; pe < m.n_pes; ++pe) {
             for (uint32_t t = 0; t < n_eval_toks; ++t) {
                 uint32_t dst_tok = sym_slot->is_decode ? t : (n_tokens - 1);
-                ggml_fp16_to_fp32_row(
-                    peer_src + (size_t)t * pe_v_cnt,
-                    full_logits_buf.data() + (size_t)dst_tok * m.n_vocab + pe_v_off,
-                    (int64_t)pe_v_cnt
-                );
+                const logit_cand_t * cands = sym_tp->peer_top_logits[pe][t];
+                for (int k = 0; k < TOP_S_SUPPORT; ++k) {
+                    if (cands[k].token_id >= 0) {
+                        int32_t flat_idx = (int32_t)((size_t)dst_tok * m.n_vocab + (uint32_t)cands[k].token_id);
+                        full_logits_buf[flat_idx] = cands[k].logit;
+                        touched_ids.push_back(flat_idx);
+                    }
+                }
             }
         }
 
