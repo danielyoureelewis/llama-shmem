@@ -127,14 +127,13 @@ void shmem_op_tp_allreduce(struct ggml_tensor * dst, const struct ggml_tensor * 
         // Wait until XOR partner's stage s buffer arrives in local symmetric memory
         shmem_ulong_wait_until(&sym_tp->stage_ready_seq[slot][s], SHMEM_CMP_GE, seq);
 
-        const float * __restrict p_buf = sym_tp->stage_peer_buf[slot][s];
+        const float * __restrict p_buf = (const float *)__builtin_assume_aligned(sym_tp->stage_peer_buf[slot][s], 64);
         float       * __restrict out   = dst_ptr;
+        #pragma omp simd
         for (size_t i = 0; i < total_floats; ++i) {
             out[i] += p_buf[i];
         }
     }
-
-    shmem_quiet();
 }
 
 struct sharded_layer_t {
@@ -624,13 +623,21 @@ static uint32_t propose_neural_draft(
     const uint32_t max_nodes = (uint32_t)(1 + k_draft);
     llama_memory_t mem = llama_get_memory(draft_ctx);
 
-    // Track exact token IDs materialized in draft_ctx KV cache (including speculative forward tokens)
-    // so accepted primary-branch tokens are reused in-place without calling seq_rm + re-decoding them.
-    static std::vector<int32_t> draft_kv_tokens;
+    struct cached_branch_t {
+        bool          valid = false;
+        int32_t       tok_id = -1;
+        int32_t       t1 = 0, t2 = 0;
+        float         q1 = 1.0f, q2 = 1.0f;
+        uint8_t       q_len = 0;
+        sparse_prob_t q_sup[TOP_S_SUPPORT];
+    };
+    static std::vector<int32_t>         draft_kv_tokens;
+    static std::vector<cached_branch_t> draft_kv_branches;
 
     uint32_t target_len = (uint32_t)history.size();
     if (draft_kv_len == 0 && !draft_kv_tokens.empty()) {
         draft_kv_tokens.clear();
+        draft_kv_branches.clear();
     }
 
     uint32_t match_len = 0;
@@ -639,16 +646,27 @@ static uint32_t propose_neural_draft(
         match_len++;
     }
 
-    // Ensure at least the final token (target_len - 1) is decoded so llama_get_logits_ith(draft_ctx, -1) has Root's logits
+    // Check if the entire history up to target_len - 1 is ALREADY in draft_ctx KV cache with cached branch predictions!
+    bool root_from_cache = false;
     if (match_len == target_len && match_len > 0) {
-        match_len--;
+        if (draft_kv_branches[target_len - 1].valid && draft_kv_branches[target_len - 1].tok_id == history[target_len - 1]) {
+            root_from_cache = true;
+        } else {
+            match_len--;
+        }
     }
 
     if (match_len < (uint32_t)draft_kv_tokens.size()) {
         llama_memory_seq_rm(mem, 0, (llama_pos)match_len, -1);
         draft_kv_tokens.resize(match_len);
+        draft_kv_branches.resize(match_len);
     }
     draft_kv_len = match_len;
+
+    sparse_prob_t q_sup[TOP_S_SUPPORT];
+    uint8_t q_len = 0;
+    int32_t t1 = 0, t2 = 0;
+    float q1 = 1.0f, q2 = 1.0f;
 
     // Sync only the uncached tail of history into seq 0
     if (target_len > draft_kv_len) {
@@ -669,21 +687,38 @@ static uint32_t propose_neural_draft(
         llama_batch_free(batch);
         for (uint32_t i = 0; i < n_new; ++i) {
             draft_kv_tokens.push_back(history[draft_kv_len + i]);
+            draft_kv_branches.push_back(cached_branch_t{});
         }
         draft_kv_len = target_len;
+
+        const float * cur_logits = llama_get_logits_ith(draft_ctx, -1);
+        sample_branch_children(cur_logits, n_vocab, temperature, min_p, rng, q_sup, q_len, t1, q1, t2, q2);
+        cached_branch_t & cb = draft_kv_branches[target_len - 1];
+        cb.valid  = true;
+        cb.tok_id = history[target_len - 1];
+        cb.t1 = t1; cb.q1 = q1;
+        cb.t2 = t2; cb.q2 = q2;
+        cb.q_len = q_len;
+        memcpy(cb.q_sup, q_sup, q_len * sizeof(sparse_prob_t));
+    } else if (root_from_cache) {
+        const cached_branch_t & cb = draft_kv_branches[target_len - 1];
+        t1 = cb.t1; q1 = cb.q1;
+        t2 = cb.t2; q2 = cb.q2;
+        q_len = cb.q_len;
+        memcpy(q_sup, cb.q_sup, q_len * sizeof(sparse_prob_t));
     }
 
     uint32_t n_nodes = 1;
-    auto add_node = [&](int8_t p, int32_t tok, float q_val, const sparse_prob_t * q_sup, uint8_t q_len) -> uint32_t {
+    auto add_node = [&](int8_t p, int32_t tok, float q_val, const sparse_prob_t * q_s, uint8_t q_l) -> uint32_t {
         uint32_t u = n_nodes++;
         uint32_t d_idx = u - 1;
         pkt->draft_ids[u]         = tok;
         pkt->parent_idx[u]        = p;
         pkt->pos[u]               = pkt->pos[p] + 1;
         pkt->parent_mask[u]       = (uint16_t)(pkt->parent_mask[p] | (1U << u));
-        pkt->q_support_len[d_idx] = q_len;
+        pkt->q_support_len[d_idx] = q_l;
         pkt->q_sampled[d_idx]     = q_val;
-        memcpy(pkt->q_sparse[d_idx], q_sup, q_len * sizeof(sparse_prob_t));
+        memcpy(pkt->q_sparse[d_idx], q_s, q_l * sizeof(sparse_prob_t));
         return u;
     };
 
@@ -698,21 +733,12 @@ static uint32_t propose_neural_draft(
         return llama_decode(draft_ctx, one_tok) == 0;
     };
 
-    // Depth 1 (0 extra decodes): Sample top-1 and top-2 from Root logits
-    const float * cur_logits = llama_get_logits_ith(draft_ctx, -1);
-    sparse_prob_t q_sup[TOP_S_SUPPORT];
-    uint8_t q_len = 0;
-    int32_t t1 = 0, t2 = 0;
-    float q1 = 1.0f, q2 = 1.0f;
-    sample_branch_children(cur_logits, n_vocab, temperature, min_p, rng, q_sup, q_len, t1, q1, t2, q2);
-
     uint32_t cur_primary = add_node(0, t1, q1, q_sup, q_len); // Node 1: Depth-1 top-1
     if (n_nodes < max_nodes && k_draft >= 2) {
         add_node(0, t2, q2, q_sup, q_len);                    // Node 2: Depth-1 top-2
     }
 
-    // Forward-Only Heavy-Path Expansion: at each depth, decode only the primary top-1 token
-    // and attach both its top-1 and top-2 children (2 tree nodes per single-token decode, 0 rewinds!)
+    // Forward-Only Heavy-Path Expansion with Branch Prediction Caching
     uint32_t cur_kv_pos = draft_kv_len;
     while (n_nodes < max_nodes) {
         int32_t fwd_tok = pkt->draft_ids[cur_primary];
@@ -720,10 +746,19 @@ static uint32_t propose_neural_draft(
             break;
         }
         draft_kv_tokens.push_back(fwd_tok);
-        cur_kv_pos++;
-        cur_logits = llama_get_logits_ith(draft_ctx, -1);
+        const float * cur_logits = llama_get_logits_ith(draft_ctx, -1);
         sample_branch_children(cur_logits, n_vocab, temperature, min_p, rng, q_sup, q_len, t1, q1, t2, q2);
 
+        cached_branch_t cb;
+        cb.valid  = true;
+        cb.tok_id = fwd_tok;
+        cb.t1 = t1; cb.q1 = q1;
+        cb.t2 = t2; cb.q2 = q2;
+        cb.q_len = q_len;
+        memcpy(cb.q_sup, q_sup, q_len * sizeof(sparse_prob_t));
+        draft_kv_branches.push_back(cb);
+
+        cur_kv_pos++;
         uint32_t next_primary = add_node((int8_t)cur_primary, t1, q1, q_sup, q_len);
         if (n_nodes < max_nodes) {
             add_node((int8_t)cur_primary, t2, q2, q_sup, q_len);
