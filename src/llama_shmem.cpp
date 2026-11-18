@@ -19,7 +19,7 @@
 #include "gguf.h"
 #include "llama.h"
 
-#define MAX_K_DRAFT 7
+#define MAX_K_DRAFT   7
 #define MAX_B_VERIFY  (MAX_K_DRAFT + 1)
 #define TOP_S_SUPPORT 32
 #define MAX_D_MODEL   8192
@@ -55,18 +55,10 @@ struct __attribute__((aligned(64))) shmem_spec_packet_t {
     unsigned long step_flag;
 };
 
-// Compact Top-S (32) candidate pair for distributed sharded LM head gather (256 bytes/token)
-struct logit_cand_t {
-    int32_t token_id;
-    float   logit;
-};
-
-// Multi-Stage Butterfly (Recursive Doubling) FP16 RDMA Exchange Buffer + Compact Top-S LM Head Gather
+// Multi-Stage Butterfly (Recursive Doubling) RDMA Exchange Buffer for N_PES = 2, 4, 8, 16, 32, 64
 struct __attribute__((aligned(64))) shmem_tp_sync_t {
-    ggml_fp16_t   stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
+    float         stage_peer_buf[2][MAX_LOG2_PES][MAX_B_VERIFY * MAX_D_MODEL];
     unsigned long stage_ready_seq[2][MAX_LOG2_PES];
-    logit_cand_t  peer_top_logits[8][MAX_B_VERIFY][TOP_S_SUPPORT];
-    unsigned long logits_ready_seq[8];
 };
 
 static shmem_spec_packet_t * sym_slot = nullptr;
@@ -104,40 +96,34 @@ void shmem_op_tp_allreduce(struct ggml_tensor * dst, const struct ggml_tensor * 
 
     tp_allreduce_ctx_t * tp = (tp_allreduce_ctx_t *)userdata;
     const size_t total_floats = ggml_nelements(src);
-    const size_t nbytes_f32   = total_floats * sizeof(float);
-    const size_t nbytes_f16   = total_floats * sizeof(ggml_fp16_t);
+    const size_t nbytes = total_floats * sizeof(float);
     const float * src_ptr = (const float *)src->data;
     float * dst_ptr = (float *)dst->data;
 
     if (dst_ptr != src_ptr) {
-        memcpy(dst_ptr, src_ptr, nbytes_f32);
+        memcpy(dst_ptr, src_ptr, nbytes);
     }
     if (tp->n_pes <= 1) return;
 
     const int slot = tp->buf_slot;
     const unsigned long seq = ++tp_op_seq[slot];
 
-    thread_local ggml_fp16_t tx_f16[MAX_B_VERIFY * MAX_D_MODEL];
-    thread_local float       rx_f32[MAX_B_VERIFY * MAX_D_MODEL];
-
     int s = 0;
     for (int dist = 1; dist < tp->n_pes; dist <<= 1, ++s) {
         const int peer_pe = tp->my_pe ^ dist;
 
-        // Quantize current accumulated F32 activations to FP16 for 2x faster RDMA transfer
-        ggml_fp32_to_fp16_row(dst_ptr, tx_f16, (int64_t)total_floats);
-
-        shmem_putmem_nbi(sym_tp->stage_peer_buf[slot][s], tx_f16, nbytes_f16, peer_pe);
+        // Send current accumulated buffer to XOR partner for stage s
+        shmem_putmem_nbi(sym_tp->stage_peer_buf[slot][s], dst_ptr, nbytes, peer_pe);
         shmem_fence();
         shmem_ulong_put_nbi(&sym_tp->stage_ready_seq[slot][s], &seq, 1, peer_pe);
 
-        // Wait until XOR partner's stage s FP16 buffer arrives in local symmetric memory
+        // Wait until XOR partner's stage s buffer arrives in local symmetric memory
         shmem_ulong_wait_until(&sym_tp->stage_ready_seq[slot][s], SHMEM_CMP_GE, seq);
 
-        ggml_fp16_to_fp32_row(sym_tp->stage_peer_buf[slot][s], rx_f32, (int64_t)total_floats);
-        float * __restrict out = dst_ptr;
+        const float * __restrict p_buf = sym_tp->stage_peer_buf[slot][s];
+        float       * __restrict out   = dst_ptr;
         for (size_t i = 0; i < total_floats; ++i) {
-            out[i] += rx_f32[i];
+            out[i] += p_buf[i];
         }
     }
 
@@ -175,8 +161,6 @@ struct sharded_model_t {
     uint32_t n_head_local;
     uint32_t n_head_kv_local;
     uint32_t n_ff_local;
-    uint32_t vocab_offset;
-    uint32_t vocab_count;
 
     float    rms_eps;
     float    rope_freq_base;
@@ -282,15 +266,12 @@ static struct ggml_tensor * load_gguf_tensor_col_shard(
     }
 
     int64_t ne0 = meta->ne[0];
-    int64_t base_rows = meta->ne[1] / n_pes;
-    int64_t row_start = (int64_t)my_pe * base_rows;
-    int64_t ne1_local = (my_pe == n_pes - 1) ? (meta->ne[1] - row_start) : base_rows;
+    int64_t ne1_local = meta->ne[1] / n_pes;
     struct ggml_tensor * t = ggml_new_tensor_2d(dst_ctx, meta->type, ne0, ne1_local);
     ggml_set_name(t, name.c_str());
 
-    size_t row_bytes    = ggml_row_size(meta->type, ne0);
-    size_t nbytes       = (size_t)ne1_local * row_bytes;
-    size_t shard_offset = base_offset + (size_t)row_start * row_bytes;
+    size_t nbytes = ggml_nbytes(t);
+    size_t shard_offset = base_offset + (size_t)my_pe * nbytes;
     if (pread(fd, t->data, nbytes, (off_t)shard_offset) != (ssize_t)nbytes) {
         fprintf(stderr, "[PE %d] Failed reading 2D col shard %s\n", my_pe, name.c_str());
         exit(1);
@@ -429,16 +410,13 @@ static void load_tp_sharded_gguf(const char * path, sharded_model_t & m) {
     int fd = open(path, O_RDONLY);
     size_t bytes_loaded = 0;
 
-    uint32_t base_v = m.n_vocab / (uint32_t)m.n_pes;
-    m.vocab_offset  = (uint32_t)m.my_pe * base_v;
-    m.vocab_count   = (m.my_pe == m.n_pes - 1) ? (m.n_vocab - m.vocab_offset) : base_v;
-
-    m.tok_embd    = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "token_embd.weight", bytes_loaded);
-    m.output_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output_norm.weight", bytes_loaded);
-    m.output      = load_gguf_tensor_col_shard(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output.weight", m.my_pe, m.n_pes, bytes_loaded);
-    if (!m.output) {
-        size_t row_bytes = ggml_row_size(m.tok_embd->type, m.n_embd);
-        m.output = ggml_view_2d(m.weight_ctx, m.tok_embd, m.n_embd, m.vocab_count, row_bytes, (size_t)m.vocab_offset * row_bytes);
+    m.tok_embd = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "token_embd.weight", bytes_loaded);
+    if (m.my_pe == 0) {
+        m.output_norm = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output_norm.weight", bytes_loaded);
+        m.output      = load_gguf_tensor_full(fd, gguf_ctx, meta_ctx, m.weight_ctx, "output.weight", bytes_loaded);
+        if (!m.output) {
+            m.output = m.tok_embd;
+        }
     }
 
     m.layers.resize(m.n_layer);
@@ -669,16 +647,25 @@ static uint32_t propose_neural_draft(
         return u;
     };
 
-    llama_batch one_tok = llama_batch_init(1, 0, 1);
+    uint32_t cur_kv_end = draft_kv_len;
     auto decode_single_at = [&](int32_t tok, uint32_t kv_pos) -> bool {
-        llama_memory_seq_rm(mem, 0, (llama_pos)kv_pos, -1);
+        if (kv_pos < cur_kv_end) {
+            llama_memory_seq_rm(mem, 0, (llama_pos)kv_pos, -1);
+        }
+        llama_batch one_tok = llama_batch_init(1, 0, 1);
         one_tok.n_tokens     = 1;
         one_tok.token[0]     = tok;
         one_tok.pos[0]       = (llama_pos)kv_pos;
         one_tok.n_seq_id[0]  = 1;
         one_tok.seq_id[0][0] = 0;
         one_tok.logits[0]    = 1;
-        return llama_decode(draft_ctx, one_tok) == 0;
+        int rc = llama_decode(draft_ctx, one_tok);
+        llama_batch_free(one_tok);
+        if (rc == 0) {
+            cur_kv_end = kv_pos + 1;
+            return true;
+        }
+        return false;
     };
 
     // Depth 1: Sample top-1 (and top-2 if k_draft >= 2) from Root logits
@@ -696,7 +683,6 @@ static uint32_t propose_neural_draft(
     }
 
     if (n_nodes >= max_nodes) {
-        llama_batch_free(one_tok);
         return n_nodes;
     }
 
@@ -713,8 +699,8 @@ static uint32_t propose_neural_draft(
             n_d2_b = (int32_t)add_node((int8_t)n_d1_a, t2, q2, q_sup1, q_len1); // Node 4: d1_a top-2
         }
 
-        // If k_draft >= 6, also expand Depth 3 along Branch A while n_d1_a is still in KV cache!
-        if (n_nodes < max_nodes && k_draft >= 6) {
+        // Expand Depth 3 along primary branch A (pos = draft_kv_len + 1, no seq_rm needed!)
+        if (n_nodes < max_nodes && k_draft >= 5) {
             if (decode_single_at(pkt->draft_ids[n_d2_a], draft_kv_len + 1)) {
                 const float * l_d2_a = llama_get_logits_ith(draft_ctx, -1);
                 sparse_prob_t q_sup3[TOP_S_SUPPORT];
@@ -722,34 +708,16 @@ static uint32_t propose_neural_draft(
                 int32_t d3_t1 = 0, d3_t2 = 0;
                 float d3_q1 = 1.0f, d3_q2 = 1.0f;
                 sample_branch_children(l_d2_a, n_vocab, temperature, min_p, rng, q_sup3, q_len3, d3_t1, d3_q1, d3_t2, d3_q2);
-                uint32_t n_d3_a = add_node((int8_t)n_d2_a, d3_t1, d3_q1, q_sup3, q_len3);
-
-                // Optional Depth 4 along primary branch if space remains
-                if (n_nodes < max_nodes && k_draft >= 7 && (n_d1_b < 0)) {
-                    if (decode_single_at(pkt->draft_ids[n_d3_a], draft_kv_len + 2)) {
-                        const float * l_d3_a = llama_get_logits_ith(draft_ctx, -1);
-                        sparse_prob_t q_sup4[TOP_S_SUPPORT];
-                        uint8_t q_len4 = 0;
-                        sample_branch_children(l_d3_a, n_vocab, temperature, min_p, rng, q_sup4, q_len4, d3_t1, d3_q1, d3_t2, d3_q2);
-                        add_node((int8_t)n_d3_a, d3_t1, d3_q1, q_sup4, q_len4);
-                    }
+                uint32_t n_d3_a = add_node((int8_t)n_d2_a, d3_t1, d3_q1, q_sup3, q_len3); // Node 5: d2_a top-1
+                if (n_nodes < max_nodes && k_draft >= 7) {
+                    add_node((int8_t)n_d2_a, d3_t2, d3_q2, q_sup3, q_len3); // Node 6: d2_a top-2
                 }
-            }
-            if (n_nodes < max_nodes && n_d2_b >= 0 && (n_nodes + 1 < max_nodes)) {
-                if (decode_single_at(pkt->draft_ids[n_d2_b], draft_kv_len + 1)) {
-                    const float * l_d2_b = llama_get_logits_ith(draft_ctx, -1);
-                    sparse_prob_t q_sup4[TOP_S_SUPPORT];
-                    uint8_t q_len4 = 0;
-                    int32_t d3_t1 = 0, d3_t2 = 0;
-                    float d3_q1 = 1.0f, d3_q2 = 1.0f;
-                    sample_branch_children(l_d2_b, n_vocab, temperature, min_p, rng, q_sup4, q_len4, d3_t1, d3_q1, d3_t2, d3_q2);
-                    add_node((int8_t)n_d2_b, d3_t1, d3_q1, q_sup4, q_len4);
-                }
+                (void)n_d3_a;
             }
         }
     }
 
-    // Expand Branch B (from n_d1_b at kv_pos = draft_kv_len) if space remains
+    // Expand Branch B (from n_d1_b at kv_pos = draft_kv_len) if space remains (e.g. k_draft >= 6)
     if (n_nodes < max_nodes && n_d1_b >= 0) {
         if (decode_single_at(pkt->draft_ids[n_d1_b], draft_kv_len)) {
             const float * l_d1_b = llama_get_logits_ith(draft_ctx, -1);
@@ -759,122 +727,14 @@ static uint32_t propose_neural_draft(
             float b_q1 = 1.0f, b_q2 = 1.0f;
             sample_branch_children(l_d1_b, n_vocab, temperature, min_p, rng, q_sup2, q_len2, b_t1, b_q1, b_t2, b_q2);
             add_node((int8_t)n_d1_b, b_t1, b_q1, q_sup2, q_len2);
-            if (n_nodes < max_nodes) {
-                add_node((int8_t)n_d1_b, b_t2, b_q2, q_sup2, q_len2);
-            }
         }
     }
-
-    llama_batch_free(one_tok);
     return n_nodes;
 }
 
-// Fast O(N_PES * TOP_S_SUPPORT) = O(128) sampler over pre-extracted per-PE top candidates (eliminates 152K vocab scan & 4.8MB buffer on PE 0)
-static int32_t sample_from_top_candidates(
-    uint32_t tok_slot,
-    int n_pes,
-    float temperature,
-    float min_p,
-    splitmix64_t & rng,
-    sparse_prob_t out_top_s[TOP_S_SUPPORT],
-    uint8_t & out_len
-) {
-    if (temperature <= 0.0f) {
-        int32_t best_id  = 0;
-        float   best_val = -INFINITY;
-        for (int pe = 0; pe < n_pes; ++pe) {
-            const logit_cand_t * cands = sym_tp->peer_top_logits[pe][tok_slot];
-            for (int k = 0; k < TOP_S_SUPPORT; ++k) {
-                if (cands[k].token_id >= 0 && cands[k].logit > best_val) {
-                    best_val = cands[k].logit;
-                    best_id  = cands[k].token_id;
-                }
-            }
-        }
-        out_len = 1;
-        out_top_s[0] = { best_id, 1.0f };
-        return best_id;
-    }
-
-    sparse_prob_t heap[TOP_S_SUPPORT];
-    uint32_t h_sz = 0;
-    for (int pe = 0; pe < n_pes; ++pe) {
-        const logit_cand_t * cands = sym_tp->peer_top_logits[pe][tok_slot];
-        for (int k = 0; k < TOP_S_SUPPORT; ++k) {
-            if (cands[k].token_id < 0) continue;
-            float val = cands[k].logit;
-            if (h_sz < TOP_S_SUPPORT) {
-                heap[h_sz++] = { cands[k].token_id, val };
-                if (h_sz == TOP_S_SUPPORT) {
-                    for (int i = (TOP_S_SUPPORT / 2) - 1; i >= 0; --i) {
-                        int p = i;
-                        while (true) {
-                            int l = 2 * p + 1, r = 2 * p + 2, sm = p;
-                            if (l < TOP_S_SUPPORT && heap[l].prob < heap[sm].prob) sm = l;
-                            if (r < TOP_S_SUPPORT && heap[r].prob < heap[sm].prob) sm = r;
-                            if (sm == p) break;
-                            std::swap(heap[p], heap[sm]);
-                            p = sm;
-                        }
-                    }
-                }
-            } else if (val > heap[0].prob) {
-                heap[0] = { cands[k].token_id, val };
-                int p = 0;
-                while (true) {
-                    int l = 2 * p + 1, r = 2 * p + 2, sm = p;
-                    if (l < TOP_S_SUPPORT && heap[l].prob < heap[sm].prob) sm = l;
-                    if (r < TOP_S_SUPPORT && heap[r].prob < heap[sm].prob) sm = r;
-                    if (sm == p) break;
-                    std::swap(heap[p], heap[sm]);
-                    p = sm;
-                }
-            }
-        }
-    }
-
-    std::sort(heap, heap + h_sz, [](const sparse_prob_t & a, const sparse_prob_t & b) {
-        return a.prob > b.prob;
-    });
-
-    float max_l = heap[0].prob;
-    float sum_exp = 0.0f;
-    for (uint32_t i = 0; i < h_sz; ++i) {
-        heap[i].prob = expf((heap[i].prob - max_l) / temperature);
-        sum_exp += heap[i].prob;
-    }
-    for (uint32_t i = 0; i < h_sz; ++i) {
-        heap[i].prob /= sum_exp;
-    }
-
-    float p_max  = heap[0].prob;
-    float thresh = min_p * p_max;
-    uint8_t p_len = 0;
-    float renorm = 0.0f;
-    for (uint32_t i = 0; i < h_sz; ++i) {
-        if (i == 0 || heap[i].prob >= thresh) {
-            out_top_s[p_len++] = heap[i];
-            renorm += heap[i].prob;
-        }
-    }
-    for (uint8_t i = 0; i < p_len; ++i) {
-        out_top_s[i].prob /= renorm;
-    }
-    out_len = p_len;
-
-    float r = rng.next_f32();
-    float cdf = 0.0f;
-    for (uint8_t i = 0; i < p_len; ++i) {
-        cdf += out_top_s[i].prob;
-        if (r <= cdf || i + 1 == p_len) {
-            return out_top_s[i].token_id;
-        }
-    }
-    return out_top_s[0].token_id;
-}
-
 static void verify_tree_local(
-    int n_pes,
+    const float * logits_all,
+    uint32_t n_vocab,
     uint32_t n_tokens,
     float temp,
     float min_p,
@@ -889,9 +749,10 @@ static void verify_tree_local(
     accepted_slots[0] = 0;
 
     while (true) {
+        const float * row = logits_all + (size_t)cur_node * n_vocab;
         sparse_prob_t p_sup[TOP_S_SUPPORT];
         uint8_t p_len = 0;
-        int32_t greedy_or_init = sample_from_top_candidates(cur_node, n_pes, temp, min_p, rng, p_sup, p_len);
+        int32_t greedy_or_init = sample_from_logits(row, n_vocab, temp, min_p, rng, p_sup, p_len);
 
         uint32_t children[MAX_B_VERIFY];
         uint32_t n_children = 0;
@@ -1047,9 +908,10 @@ static bool evaluate_tp_step(
                     memmove(k_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
                             k_ptr + (size_t)src_slot * n_embd_k_gqa_local,
                             slot_bytes);
-                    memmove(v_ptr + (size_t)dst_slot * n_embd_k_gqa_local,
-                            v_ptr + (size_t)src_slot * n_embd_k_gqa_local,
-                            slot_bytes);
+                    // v_cache is stored transposed as [MAX_CTX, n_embd_k_gqa_local]: copy column src_slot -> dst_slot
+                    for (uint32_t e = 0; e < n_embd_k_gqa_local; ++e) {
+                        v_ptr[(size_t)e * MAX_CTX + dst_slot] = v_ptr[(size_t)e * MAX_CTX + src_slot];
+                    }
                 }
             }
         }
@@ -1108,8 +970,14 @@ static bool evaluate_tp_step(
         size_t kv_offset = (size_t)kv_commit_idx * n_embd_k_gqa_local * sizeof(float);
         size_t kv_len    = (size_t)n_tokens * n_embd_k_gqa_local;
         struct ggml_tensor * k_updated = ggml_set_1d_inplace(ctx, l.k_cache, ggml_reshape_1d(ctx, Kcur, kv_len), kv_offset);
-        struct ggml_tensor * v_updated = ggml_set_1d_inplace(ctx, l.v_cache, ggml_reshape_1d(ctx, Vcur, kv_len), kv_offset);
         ggml_build_forward_expand(gf, k_updated);
+
+        // Store Vcur [n_embd_k_gqa_local, n_tokens] directly into pre-transposed v_cache [MAX_CTX, n_embd_k_gqa_local]
+        struct ggml_tensor * v_view_dst = ggml_view_2d(ctx, l.v_cache,
+            n_tokens, n_embd_k_gqa_local,
+            MAX_CTX * sizeof(float),
+            (size_t)kv_commit_idx * sizeof(float));
+        struct ggml_tensor * v_updated = ggml_cpy(ctx, ggml_transpose(ctx, Vcur), v_view_dst);
         ggml_build_forward_expand(gf, v_updated);
 
         struct ggml_tensor * K_mem = ggml_view_3d(ctx, k_updated,
@@ -1117,17 +985,17 @@ static bool evaluate_tp_step(
             n_embd_head * sizeof(float),
             n_embd_k_gqa_local * sizeof(float), 0);
 
-        struct ggml_tensor * V_mem = ggml_view_3d(ctx, v_updated,
-            n_embd_head, n_head_kv_local, n_kv,
-            n_embd_head * sizeof(float),
-            n_embd_k_gqa_local * sizeof(float), 0);
+        // Zero-copy contiguous view of pre-transposed v_cache [n_kv, n_embd_head, n_head_kv_local]
+        struct ggml_tensor * v = ggml_view_3d(ctx, l.v_cache,
+            n_kv, n_embd_head, n_head_kv_local,
+            MAX_CTX * sizeof(float),
+            MAX_CTX * n_embd_head * sizeof(float), 0);
 
         struct ggml_tensor * q  = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
         struct ggml_tensor * k  = ggml_permute(ctx, K_mem, 0, 2, 1, 3);
         struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
         kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f / sqrtf((float)n_embd_head), 0.0f);
 
-        struct ggml_tensor * v   = ggml_cont(ctx, ggml_permute(ctx, V_mem, 1, 2, 0, 3));
         struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx, kqv, n_embd_q_local, n_tokens);
@@ -1149,88 +1017,31 @@ static bool evaluate_tp_step(
         cur = ggml_add(ctx, cur, residual);
     }
 
-    // All PEs compute their 1/N_PES slice of the vocabulary LM head in parallel
-    cur = ggml_rms_norm(ctx, cur, m.rms_eps);
-    cur = ggml_mul(ctx, cur, m.output_norm);
-    cur = ggml_mul_mat(ctx, m.output, cur);
+    if (m.my_pe == 0) {
+        cur = ggml_rms_norm(ctx, cur, m.rms_eps);
+        cur = ggml_mul(ctx, cur, m.output_norm);
+        cur = ggml_mul_mat(ctx, m.output, cur);
+    }
 
     ggml_build_forward_expand(gf, cur);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
-    const uint32_t n_eval_toks  = sym_slot->is_decode ? n_tokens : 1;
-    const size_t   tok_start    = sym_slot->is_decode ? 0 : (size_t)(n_tokens - 1);
-    const float *  local_logits = (const float *)cur->data + tok_start * (size_t)m.vocab_count;
-
-    // Fast local Top-S (or Top-1 in greedy mode) extraction per token
-    const bool is_greedy = (sym_slot->temperature <= 0.0f);
-    for (uint32_t t = 0; t < n_eval_toks; ++t) {
-        const float * row = local_logits + (size_t)t * m.vocab_count;
-        logit_cand_t * top_k = sym_tp->peer_top_logits[m.my_pe][t];
-        for (int k = 0; k < TOP_S_SUPPORT; ++k) {
-            top_k[k] = { -1, -INFINITY };
-        }
-        if (is_greedy) {
-            float best_val = row[0];
-            uint32_t best_v = 0;
-            for (uint32_t v = 1; v < m.vocab_count; ++v) {
-                if (row[v] > best_val) {
-                    best_val = row[v];
-                    best_v   = v;
-                }
-            }
-            top_k[0] = { (int32_t)(m.vocab_offset + best_v), best_val };
-        } else {
-            float min_top = -INFINITY;
-            int   min_idx = 0;
-            for (uint32_t v = 0; v < m.vocab_count; ++v) {
-                float val = row[v];
-                if (val > min_top) {
-                    top_k[min_idx] = { (int32_t)(m.vocab_offset + v), val };
-                    min_top = top_k[0].logit;
-                    min_idx = 0;
-                    for (int k = 1; k < TOP_S_SUPPORT; ++k) {
-                        if (top_k[k].logit < min_top) {
-                            min_top = top_k[k].logit;
-                            min_idx = k;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    static unsigned long logits_seq = 0;
-    const unsigned long l_seq = ++logits_seq;
-
-    if (m.my_pe != 0) {
-        // Send only 256 bytes per token (n_eval_toks * 32 * 8 bytes = <= 2 KB total!) to PE 0
-        shmem_putmem_nbi(
-            sym_tp->peer_top_logits[m.my_pe],
-            sym_tp->peer_top_logits[m.my_pe],
-            (size_t)n_eval_toks * TOP_S_SUPPORT * sizeof(logit_cand_t),
-            0
-        );
-        shmem_fence();
-        shmem_ulong_put_nbi(&sym_tp->logits_ready_seq[m.my_pe], &l_seq, 1, 0);
-        shmem_quiet();
-    } else {
-        for (int pe = 1; pe < m.n_pes; ++pe) {
-            shmem_ulong_wait_until(&sym_tp->logits_ready_seq[pe], SHMEM_CMP_GE, l_seq);
-        }
-
-        const float temp  = sym_slot->temperature;
-        const float min_p = sym_slot->min_p;
+    if (m.my_pe == 0) {
+        const float * logits_all = (const float *)cur->data;
+        const float temp         = sym_slot->temperature;
+        const float min_p        = sym_slot->min_p;
         splitmix64_t tail_rng(sym_slot->rng_seed);
 
         if (!sym_slot->is_decode) {
+            const float * last_logits = logits_all + (size_t)(n_tokens - 1) * m.n_vocab;
             sparse_prob_t dummy_sup[TOP_S_SUPPORT];
             uint8_t dummy_len = 0;
             out_n_accepted    = 0;
             out_n_committed   = 1;
             accepted_slots[0] = 0;
-            committed_ids[0]  = sample_from_top_candidates(0, m.n_pes, temp, min_p, tail_rng, dummy_sup, dummy_len);
+            committed_ids[0]  = sample_from_logits(last_logits, m.n_vocab, temp, min_p, tail_rng, dummy_sup, dummy_len);
         } else {
-            verify_tree_local(m.n_pes, n_tokens, temp, min_p, tail_rng,
+            verify_tree_local(logits_all, m.n_vocab, n_tokens, temp, min_p, tail_rng,
                               out_n_accepted, out_n_committed, committed_ids, accepted_slots);
         }
     }
@@ -1297,7 +1108,7 @@ int main(int argc, char ** argv) {
             struct llama_context_params d_cparams = llama_context_default_params();
             d_cparams.n_ctx           = MAX_CTX;
             d_cparams.n_batch         = MAX_CTX;
-            d_cparams.n_threads       = n_threads;
+            d_cparams.n_threads       = std::min(2, n_threads);
             d_cparams.n_threads_batch = n_threads;
             draft_ctx = llama_init_from_model(draft_model, d_cparams);
             vocab     = llama_model_get_vocab(draft_model);
